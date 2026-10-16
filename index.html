@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Nimbus</title>
+  </head>
+  <body>
+    <header id="titlebar" data-tauri-drag-region>
+      <nav id="tabs" data-tauri-drag-region></nav>
+    </header>
+    <div id="body">
+      <section id="home">
+        <aside id="sidebar"></aside>
+        <main id="content"></main>
+        <aside id="drawer" hidden></aside>
+      </section>
+      <section id="terminals" hidden></section>
+    </div>
+    <div id="toasts"></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
