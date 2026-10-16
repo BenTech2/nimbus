@@ -165,7 +165,8 @@ pub fn open_with_passphrase(passphrase: &str, sealed: &Sealed) -> anyhow::Result
     if sealed.cipher != "aes-256-gcm" || sealed.kdf != "scrypt" {
         return Err(anyhow!("unsupported export encryption"));
     }
-    if sealed.log_n > 22 || sealed.r > 32 || sealed.p > 16 {
+    // Capped so a crafted file can't make scrypt demand gigabytes of memory.
+    if sealed.log_n > 20 || sealed.r > 16 || sealed.p > 4 {
         return Err(anyhow!("export encryption parameters are out of range"));
     }
     let key = derive(passphrase, &B64.decode(&sealed.salt)?, sealed.log_n, sealed.r, sealed.p)?;

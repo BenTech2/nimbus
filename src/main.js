@@ -3,27 +3,35 @@ import './styles.css';
 import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { listen } from '@tauri-apps/api/event';
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import { api } from './api.js';
 import { COLORS, confirmDialog, contextMenu, esc, icon, initials, modal, modalOpen, timeAgo, toast, uid } from './ui.js';
 import { TermSession } from './terminal.js';
+import { FileSession, listenForFileDrops, protocolLabel } from './files.js';
+import { API_KINDS, ENVIRONMENTS, buildCopy, copyFormats, envColor, expiryInfo, identity, primaryField } from './apikeys.js';
 
 // Opened in a plain browser during development: fake the backend so the UI still works.
 if (import.meta.env.DEV && !('__TAURI_INTERNALS__' in window)) await import('./dev-mock.js');
 
 const isMac = navigator.userAgent.includes('Mac');
 if (isMac) document.body.classList.add('mac');
+// Use the last theme straight away so the window doesn't flash dark before settings load.
+try { document.documentElement.dataset.theme = localStorage.getItem('nimbus-theme') || 'dark'; } catch { /* storage unavailable */ }
 const MOD = isMac ? '⌘' : 'Ctrl+Shift+';
 
 const $ = (sel, root = document) => root.querySelector(sel);
 
 const app = {
   snap: null,
-  view: 'hosts', // hosts | keys | snippets | known | transfer | settings
+  view: 'hosts', // hosts | passwords | keys | snippets | known | transfer | settings
   groupId: null,
   search: '',
   drawer: null, // { kind, id }
+  pwGroupId: 'all', // Passwords view filter: 'all', 'none' or a password group id
+  apiGroupId: 'all', // API Keys view filter, same values
   sessions: [],
-  active: null, // null = home tab, else a TermSession
+  active: null, // null = home tab, else a TermSession or FileSession
 
   // --- lookups used by TermSession ---
   data() { return this.snap.data; },
@@ -35,17 +43,33 @@ const app = {
   snippets() { return [...this.snap.data.snippets].sort(byName); },
   passwords() { return [...this.snap.data.passwords].sort(byName); },
   password(id) { return this.snap.data.passwords.find((p) => p.id === id); },
+  pwGroup(id) { return this.snap.data.passwordGroups.find((g) => g.id === id); },
+  apiKey(id) { return this.snap.data.apiKeys.find((a) => a.id === id); },
+  apiGroup(id) { return this.snap.data.apiGroups.find((g) => g.id === id); },
   flags(id) { return this.snap.secrets[id] || {}; },
   modalOpen,
 
   // --- sessions ---
+  /** Open a host: a terminal for SSH hosts, the file browser for FTP hosts. */
   connect(hostId) {
     const host = this.host(hostId);
     if (!host) return;
-    const s = new TermSession(this, host);
+    if (!isSsh(host) && !isSerial(host)) return this.openFiles(hostId);
+    this.open(new TermSession(this, host));
+  },
+  /** A Files tab: SFTP for SSH hosts, FTP/FTPS otherwise. */
+  openFiles(hostId) {
+    const host = this.host(hostId);
+    if (host) this.open(new FileSession(this, host));
+  },
+  open(s) {
     this.sessions.push(s);
     this.activate(s);
     s.connect();
+  },
+  duplicate(s) {
+    if (s.kind === 'files') this.openFiles(s.hostId);
+    else this.connect(s.hostId);
   },
   activate(s) {
     if (this.active !== s) {
@@ -92,6 +116,13 @@ const app = {
   },
 };
 
+const isSsh = (h) => !['ftp', 'ftps', 'serial'].includes(h.protocol);
+const isSerial = (h) => h.protocol === 'serial';
+const BAUDS = [300, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
+/** "115200 8N1" style summary of a serial host's line settings. */
+const serialSummary = (h) => `${h.baudRate || 9600} ${h.dataBits || 8}${{ odd: 'O', even: 'E' }[h.parity] || 'N'}${h.stopBits || 1}`;
+const defaultPort = (h) => (isSsh(h) ? 22 : 21);
+
 const byName = (a, b) => (a.label || a.name || '').localeCompare(b.label || b.name || '', undefined, { sensitivity: 'base', numeric: true });
 
 function setSnap(snap) {
@@ -122,10 +153,12 @@ function hostColor(h) {
 }
 
 function hostSubtitle(h) {
+  if (isSerial(h)) return `serial, ${h.address.replace(/^\/dev\/(cu\.|tty\.)?/, '')} · ${serialSummary(h)}`;
   const g = h.groupId && app.group(h.groupId);
   const user = h.username || g?.username;
-  const port = h.port || g?.port;
-  return `${h.protocol || 'ssh'}, ${user ? user + '@' : ''}${h.address}${port && port !== 22 ? ':' + port : ''}`;
+  const port = h.port || (isSsh(h) ? g?.port : null);
+  const proto = isSsh(h) ? 'ssh' : h.protocol;
+  return `${proto}, ${user ? user + '@' : ''}${h.address}${port && port !== defaultPort(h) ? ':' + port : ''}`;
 }
 
 // ---------- tabs ----------
@@ -137,8 +170,9 @@ function renderTabs() {
       .map((s, i) => {
         const h = app.host(s.hostId);
         const label = h ? h.label || h.address : s.label;
+        const kind = s.kind === 'files' ? `<span class="kind">${protocolLabel(h)}</span>` : '';
         return `<button class="tab ${app.active === s ? 'active' : ''}" data-tab="${i}" title="${esc(label)}">
-          <span class="dot ${s.state}"></span><span class="label">${esc(label)}</span>
+          <span class="dot ${s.state}"></span><span class="label">${esc(label)}</span>${kind}
           <span class="close" data-close="${i}" role="button" aria-label="Close tab">${icon.x}</span></button>`;
       })
       .join('');
@@ -164,9 +198,11 @@ $('#tabs').addEventListener('contextmenu', (e) => {
   if (!tab || tab.dataset.tab === 'home') return;
   e.preventDefault();
   const s = app.sessions[+tab.dataset.tab];
+  const h = app.host(s.hostId);
   contextMenu(e.clientX, e.clientY, [
-    { label: 'Duplicate', icon: icon.copy, action: () => app.connect(s.hostId) },
+    { label: 'Duplicate', icon: icon.copy, action: () => app.duplicate(s) },
     { label: 'Reconnect', icon: icon.refresh, action: () => { app.activate(s); s.connect(); } },
+    ...(s.kind === 'term' ? [{ label: 'Open SFTP', icon: icon.folder, action: () => app.openFiles(s.hostId) }] : h && isSsh(h) ? [{ label: 'Open terminal', icon: icon.terminal, action: () => app.connect(s.hostId) }] : []),
     { label: 'Edit host', icon: icon.edit, action: () => app.editHost(s.hostId) },
     'sep',
     { label: 'Close other tabs', action: () => app.sessions.filter((x) => x !== s).forEach((x) => app.closeSession(x)) },
@@ -179,6 +215,7 @@ const NAV = [
   ['hosts', 'Hosts', icon.server, () => app.data().hosts.length],
   ['keys', 'Keychain', icon.key, () => app.data().keys.length],
   ['passwords', 'Passwords', icon.lock, () => app.data().passwords.length],
+  ['apikeys', 'API Keys', icon.token, () => app.data().apiKeys.length, () => app.data().apiKeys.some((a) => expiryInfo(a.expires)?.level === 'expired')],
   ['snippets', 'Snippets', icon.code, () => app.data().snippets.length],
   ['known', 'Known Hosts', icon.shield, () => app.data().knownHosts.length],
   'sep',
@@ -192,7 +229,7 @@ function renderSidebar() {
     NAV.map((n) =>
       n === 'sep'
         ? '<div class="nav-sep"></div>'
-        : `<button class="nav-item ${app.view === n[0] ? 'active' : ''}" data-view="${n[0]}" title="${n[1]}">${n[2]}<span class="text">${n[1]}</span>${n[3] ? `<span class="count">${n[3]()}</span>` : ''}</button>`,
+        : `<button class="nav-item ${app.view === n[0] ? 'active' : ''}" data-view="${n[0]}" title="${n[1]}">${n[2]}<span class="text">${n[1]}</span>${n[3] ? `<span class="count">${n[4]?.() ? '<span class="alert-dot" title="Something here has expired"></span>' : ''}${n[3]()}</span>` : ''}</button>`,
     ).join('') +
     `<div class="sidebar-foot">Stored only on this computer<br>v${esc(app.snap.version)}</div>`;
 }
@@ -210,10 +247,11 @@ $('#sidebar').addEventListener('click', (e) => {
 // ---------- content ----------
 function renderContent() {
   const c = $('#content');
-  const views = { hosts: viewHosts, passwords: viewPasswords, keys: viewKeys, snippets: viewSnippets, known: viewKnown, transfer: viewTransfer, settings: viewSettings };
+  const views = { hosts: viewHosts, passwords: viewPasswords, apikeys: viewApiKeys, keys: viewKeys, snippets: viewSnippets, known: viewKnown, transfer: viewTransfer, settings: viewSettings };
   const hadSearchFocus = document.activeElement?.id === 'search';
   c.innerHTML = (app.snap.warning ? `<div class="warnbox">${esc(app.snap.warning)}</div>` : '') + views[app.view]();
   if (app.view === 'passwords') renderPasswordList();
+  if (app.view === 'apikeys') renderApiList();
   if (app.view === 'hosts') {
     renderResults();
     if (hadSearchFocus) {
@@ -231,6 +269,9 @@ function viewHosts() {
       <h1>Hosts</h1>
       <label class="search">${icon.search}<input id="search" placeholder="Search, or type user@host and press Enter" value="${esc(app.search)}" spellcheck="false" autocomplete="off"><kbd>${MOD}T</kbd></label>
       <div class="spacer"></div>
+      <div class="view-toggle" role="group" aria-label="Layout">
+        <button class="icon-btn ${hostsView() === 'grid' ? 'on' : ''}" data-act="hosts-view" data-id="grid" title="Grid">${icon.grid}</button>
+        <button class="icon-btn ${hostsView() === 'list' ? 'on' : ''}" data-act="hosts-view" data-id="list" title="List">${icon.list}</button></div>
       <button class="btn primary" data-act="new-host">${icon.plus} Host</button>
       <button class="btn" data-act="new-group">${icon.folder} Group</button>
     </div>
@@ -241,12 +282,52 @@ function viewHosts() {
 
 function hostCard(h) {
   const tags = (h.tags || []).slice(0, 2).map((t) => `<span class="tag">${esc(t)}</span>`).join('');
-  const title = h.lastConnected ? `Last connected ${timeAgo(h.lastConnected)}` : 'Click to connect';
+  const title = (h.lastConnected ? `Last connected ${timeAgo(h.lastConnected)}` : 'Click to connect') + (isSsh(h) ? '' : ' · opens the file browser');
   return `<div class="card clickable" data-host="${esc(h.id)}" title="${esc(title)}">
     <div class="avatar" style="--c:${esc(hostColor(h))}">${esc(initials(h.label || h.address))}</div>
     <div class="meta"><div class="title">${esc(h.label || h.address)}${tags}</div><div class="sub">${esc(hostSubtitle(h))}</div></div>
-    <div class="actions"><button class="icon-btn" data-act="edit-host" data-id="${esc(h.id)}" title="Edit">${icon.edit}</button></div>
+    <div class="actions">${isSsh(h) ? `<button class="icon-btn" data-act="sftp" data-id="${esc(h.id)}" title="Browse files (SFTP)">${icon.folder}</button>` : ''}
+      <button class="icon-btn" data-act="edit-host" data-id="${esc(h.id)}" title="Edit">${icon.edit}</button></div>
   </div>`;
+}
+
+const hostsView = () => (app.settings().hostsView === 'list' ? 'list' : 'grid');
+
+function hostRow(h, showGroup) {
+  const tags = (h.tags || []).slice(0, 3).map((t) => `<span class="tag">${esc(t)}</span>`).join('');
+  const g = h.groupId && app.group(h.groupId);
+  const where = hostSubtitle(h).split(', ').slice(1).join(', ');
+  const proto = isSerial(h) ? 'Serial' : isSsh(h) ? 'SSH' : h.protocol.toUpperCase();
+  return `<tr class="hrow" data-host="${esc(h.id)}" title="${esc(h.lastConnected ? `Last connected ${timeAgo(h.lastConnected)}` : 'Click to connect')}">
+    <td><div class="h-name"><div class="avatar sm" style="--c:${esc(hostColor(h))}">${esc(initials(h.label || h.address))}</div><span class="title">${esc(h.label || h.address)}</span>${tags}</div></td>
+    <td class="h-addr">${esc(where)}</td>
+    <td><span class="proto">${proto}</span></td>
+    ${showGroup ? `<td class="faint">${g ? esc(g.name) : ''}</td>` : ''}
+    <td class="faint">${h.lastConnected ? esc(timeAgo(h.lastConnected)) : 'Never'}</td>
+    <td class="row-actions">${isSsh(h) ? `<button class="icon-btn" data-act="sftp" data-id="${esc(h.id)}" title="Browse files (SFTP)">${icon.folder}</button>` : ''}
+      <button class="icon-btn" data-act="edit-host" data-id="${esc(h.id)}" title="Edit">${icon.edit}</button></td></tr>`;
+}
+
+const hostCols = (showGroup) =>
+  `<colgroup><col style="width:${showGroup ? 28 : 34}%"><col style="width:${showGroup ? 28 : 32}%"><col style="width:10%">${showGroup ? '<col style="width:14%">' : ''}<col><col style="width:76px"></colgroup>`;
+
+function hostsBlock(hosts, showGroup = false) {
+  if (hostsView() === 'grid') return `<div class="grid">${hosts.map(hostCard).join('')}</div>`;
+  return `<table class="list hosts-table">${hostCols(showGroup)}<thead><tr><th>Name</th><th>Address</th><th>Type</th>${showGroup ? '<th>Group</th>' : ''}<th>Last connected</th><th></th></tr></thead>
+    <tbody>${hosts.map((h) => hostRow(h, showGroup)).join('')}</tbody></table>`;
+}
+
+function groupsBlock(groups) {
+  if (hostsView() === 'grid') return `<div class="grid">${groups.map(groupCard).join('')}</div>`;
+  return `<table class="list hosts-table">${hostCols(false)}<tbody>${groups
+    .map((g) => {
+      const n = app.data().hosts.filter((h) => h.groupId === g.id).length;
+      const defaults = [g.username && `user ${g.username}`, g.port && `port ${g.port}`, g.keyId && app.key(g.keyId) && `key ${app.key(g.keyId).label}`].filter(Boolean).join(' · ');
+      return `<tr class="hrow" data-group="${esc(g.id)}"><td><div class="h-name"><div class="avatar sm" style="--c:${esc(g.color || '#8b91a8')}">${icon.folder}</div><span class="title">${esc(g.name)}</span></div></td>
+        <td class="faint">${n} host${n === 1 ? '' : 's'}</td><td class="faint" colspan="2">${esc(defaults)}</td>
+        <td class="row-actions"><button class="icon-btn" data-act="edit-group" data-id="${esc(g.id)}" title="Edit">${icon.edit}</button></td></tr>`;
+    })
+    .join('')}</tbody></table>`;
 }
 
 function groupCard(g) {
@@ -258,7 +339,8 @@ function groupCard(g) {
   </div>`;
 }
 
-const QUICK = /^(?:([^@\s]+)@)?(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5}))?$/;
+// [ssh|sftp|ftp|ftps://][user@]host[:port]
+const QUICK = /^(?:(ssh|sftp|ftps?):\/\/)?(?:([^@\s/]+)@)?(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5}))?\/?$/i;
 
 function searchMatches() {
   const q = app.search.trim().toLowerCase();
@@ -276,9 +358,10 @@ function renderResults() {
     const hits = searchMatches();
     const quick = QUICK.exec(q);
     r.innerHTML =
-      (hits.length ? `<div class="section-title">Results</div><div class="grid">${hits.map(hostCard).join('')}</div>` : '') +
+      (hits.length ? `<div class="section-title">Results</div>${hostsBlock(hits, true)}` : '') +
       (quick && (q.includes('@') || !hits.length)
-        ? `<div class="panel"><h2>Quick connect</h2><p>Press <strong>Enter</strong> to connect to <code>${esc(q)}</code>. It will be saved to your hosts so you can reconnect later.</p></div>`
+        ? `<div class="panel"><h2>Quick connect</h2><p>Press <strong>Enter</strong> to connect to <code>${esc(q)}</code>. It will be saved to your hosts so you can reconnect later.</p>
+            <p class="hint">Start with <code>sftp://</code>, <code>ftp://</code> or <code>ftps://</code> to open the file browser instead of a terminal.</p></div>`
         : '') +
       (!hits.length && !quick ? `<div class="empty"><p>No hosts match “${esc(q)}”.</p></div>` : '');
     return;
@@ -286,7 +369,7 @@ function renderResults() {
   if (app.groupId) {
     const hosts = d.hosts.filter((h) => h.groupId === app.groupId).sort(byName);
     r.innerHTML = hosts.length
-      ? `<div class="grid">${hosts.map(hostCard).join('')}</div>`
+      ? hostsBlock(hosts)
       : `<div class="empty"><p>This group is empty.</p><div class="row"><button class="btn primary" data-act="new-host">${icon.plus} Add a host here</button></div></div>`;
     return;
   }
@@ -301,16 +384,64 @@ function renderResults() {
   const groups = [...d.groups].sort(byName);
   const loose = d.hosts.filter((h) => !h.groupId || !app.group(h.groupId)).sort(byName);
   r.innerHTML =
-    (groups.length ? `<div class="section-title">Groups</div><div class="grid">${groups.map(groupCard).join('')}</div>` : '') +
-    (loose.length ? `<div class="section-title">Hosts</div><div class="grid">${loose.map(hostCard).join('')}</div>` : '');
+    (groups.length ? `<div class="section-title">Groups</div>${groupsBlock(groups)}` : '') +
+    (loose.length ? `<div class="section-title">Hosts</div>${hostsBlock(loose)}` : '');
 }
 
 function viewPasswords() {
+  const d = app.data();
+  const groups = [...d.passwordGroups].sort(byName);
+  if (app.pwGroupId !== 'all' && app.pwGroupId !== 'none' && !app.pwGroup(app.pwGroupId)) app.pwGroupId = 'all';
+  const count = (gid) => d.passwords.filter((p) => (gid === 'none' ? !p.groupId || !app.pwGroup(p.groupId) : p.groupId === gid)).length;
+  const chip = (id, label, n, color) => `<button class="chip ${app.pwGroupId === id ? 'active' : ''}" data-act="pw-filter" data-id="${esc(id)}">
+      ${color ? `<span class="swatch" style="--c:${esc(color)}"></span>` : ''}${esc(label)}<span class="n">${n}</span></button>`;
+  const g = app.pwGroup(app.pwGroupId);
   return `<div class="toolbar"><h1>Passwords</h1>
       <label class="search">${icon.search}<input id="pw-search" placeholder="Search passwords" value="${esc(app.pwSearch || '')}" spellcheck="false" autocomplete="off"></label>
       <div class="spacer"></div>
-      <button class="btn primary" data-act="new-password">${icon.plus} Password</button></div>
+      <button class="btn primary" data-act="new-password">${icon.plus} Password</button>
+      <button class="btn" data-act="new-pw-group">${icon.folder} Group</button></div>
+    ${d.passwords.length || groups.length
+      ? `<div class="chips">${chip('all', 'All', d.passwords.length)}${groups.map((x) => chip(x.id, x.name, count(x.id), x.color || '#8b91a8')).join('')}${groups.length ? chip('none', 'No group', count('none')) : ''}
+          ${g ? `<button class="icon-btn" data-act="edit-pw-group" data-id="${esc(g.id)}" title="Edit group">${icon.edit}</button>` : ''}</div>`
+      : ''}
     <div id="pw-results"></div>`;
+}
+
+/** A link we can open for a saved "website or address": http(s) URLs, or a bare host/IP. */
+function entryUrl(raw) {
+  const v = (raw || '').trim();
+  if (!v || /\s/.test(v)) return null;
+  let candidate = v;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(v)) {
+    // Routers, NAS boxes and other local devices usually only serve plain http.
+    const local = /^(\d{1,3}(\.\d{1,3}){3}|\[[0-9a-f:]+\]|localhost|[^/:]+\.(local|lan|home|internal))([:/]|$)/i.test(v);
+    candidate = (local ? 'http://' : 'https://') + v;
+  }
+  try {
+    const u = new URL(candidate);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function passwordRow(p, showGroup) {
+  const missing = !app.flags(p.id).password;
+  const url = entryUrl(p.url);
+  const g = p.groupId && app.pwGroup(p.groupId);
+  const revealed = app.revealed?.id === p.id ? app.revealed.value : null;
+  return `<tr class="clickable" data-password="${esc(p.id)}">
+    <td><div class="pw-name"><div class="avatar sm" style="--c:${missing ? 'var(--danger)' : esc(g?.color || '#7b5cff')}">${esc(initials(p.name))}</div>
+      <div><div class="title">${esc(p.name)}</div>${p.notes ? `<div class="sub">${esc(p.notes.split('\n')[0])}</div>` : ''}</div></div></td>
+    <td>${p.username ? `<span class="cell-copy"><span class="selectable">${esc(p.username)}</span><button class="icon-btn" data-act="copy-user" data-id="${esc(p.id)}" title="Copy username">${icon.copy}</button></span>` : '<span class="faint">—</span>'}</td>
+    <td>${missing ? '<span class="danger-text">Not saved</span>'
+      : `<span class="cell-copy"><span class="mono ${revealed ? 'selectable' : 'dots'}">${revealed ? esc(revealed) : '••••••••'}</span>
+         <button class="icon-btn" data-act="reveal-pass" data-id="${esc(p.id)}" title="${revealed ? 'Hide' : 'Show'}">${icon.eye}</button>
+         <button class="icon-btn" data-act="copy-pass" data-id="${esc(p.id)}" title="Copy password">${icon.copy}</button></span>`}</td>
+    <td class="pw-url">${url ? `<a href="${esc(url)}" data-act="open-url" data-id="${esc(p.id)}" title="Open ${esc(url)}">${esc(p.url)}</a>` : p.url ? `<span class="selectable">${esc(p.url)}</span>` : '<span class="faint">—</span>'}</td>
+    ${showGroup ? `<td class="faint">${g ? esc(g.name) : ''}</td>` : ''}
+    <td class="row-actions"><button class="icon-btn" data-act="edit-password" data-id="${esc(p.id)}" title="Edit">${icon.edit}</button></td></tr>`;
 }
 
 function renderPasswordList() {
@@ -318,39 +449,71 @@ function renderPasswordList() {
   if (!r) return;
   const q = (app.pwSearch || '').trim().toLowerCase();
   const all = app.passwords();
-  const list = q ? all.filter((p) => [p.name, p.username, p.url, p.notes].some((v) => v && v.toLowerCase().includes(q))) : all;
   if (!all.length) {
     r.innerHTML = `<div class="empty"><div class="big">${icon.lock}</div><h2>No passwords yet</h2>
       <p>Keep passwords here, encrypted on this computer. Copy them when you need them, or type one into a connected terminal with the Password button.</p>
       <div class="row"><button class="btn primary" data-act="new-password">${icon.plus} New password</button></div></div>`;
     return;
   }
-  r.innerHTML = list.length
-    ? `<div class="grid">${list
-        .map((p) => {
-          const missing = !app.flags(p.id).password;
-          return `<div class="card clickable" data-password="${esc(p.id)}">
-          <div class="avatar" style="--c:${missing ? 'var(--danger)' : '#7b5cff'}">${esc(initials(p.name))}</div>
-          <div class="meta"><div class="title">${esc(p.name)}</div><div class="sub">${missing ? 'No password saved' : esc(p.username || p.url || '')}</div></div>
-          <div class="actions">
-            ${p.username ? `<button class="icon-btn" data-act="copy-user" data-id="${esc(p.id)}" title="Copy username">${icon.user}</button>` : ''}
-            ${missing ? '' : `<button class="icon-btn" data-act="copy-pass" data-id="${esc(p.id)}" title="Copy password">${icon.copy}</button>`}
-          </div></div>`;
-        })
-        .join('')}</div>`
-    : `<div class="empty"><p>No passwords match “${esc(q)}”.</p></div>`;
+  const gid = app.pwGroupId;
+  const inGroup = (p) => gid === 'all' || (gid === 'none' ? !p.groupId || !app.pwGroup(p.groupId) : p.groupId === gid);
+  const groupName = (p) => app.pwGroup(p.groupId)?.name || '';
+  const list = all.filter(inGroup).filter((p) => !q || [p.name, p.username, p.url, p.notes, groupName(p)].some((v) => v && v.toLowerCase().includes(q)));
+  if (!list.length) {
+    r.innerHTML = `<div class="empty"><p>${q ? `No passwords match “${esc(q)}”.` : 'No passwords in this group yet.'}</p>
+      ${q ? '' : `<div class="row"><button class="btn primary" data-act="new-password">${icon.plus} Add one</button></div>`}</div>`;
+    return;
+  }
+  const groups = [...app.data().passwordGroups].sort(byName);
+  // "All" with groups: one section per group (searching flattens it, with a Group column instead).
+  const sectioned = gid === 'all' && groups.length && !q;
+  const head = `<thead><tr><th>Name</th><th>Username</th><th>Password</th><th>Website or address</th>${gid === 'all' && q && groups.length ? '<th>Group</th>' : ''}<th></th></tr></thead>`;
+  let body;
+  if (sectioned) {
+    const cols = 5;
+    const section = (title, color, rows) => (rows.length
+      ? `<tr class="group-row"><td colspan="${cols}">${color ? `<span class="swatch" style="--c:${esc(color)}"></span>` : ''}${esc(title)} <span class="n">${rows.length}</span></td></tr>${rows.map((p) => passwordRow(p, false)).join('')}`
+      : '');
+    body = groups.map((g) => section(g.name, g.color || '#8b91a8', list.filter((p) => p.groupId === g.id))).join('') +
+      section('No group', null, list.filter((p) => !p.groupId || !app.pwGroup(p.groupId)));
+  } else {
+    body = list.map((p) => passwordRow(p, gid === 'all' && q && groups.length)).join('');
+  }
+  r.innerHTML = `<table class="list pw-table">${head}<tbody>${body}</tbody></table>`;
+}
+
+async function revealPassword(id) {
+  if (app.revealed?.id === id) {
+    app.revealed = null;
+    return renderPasswordList();
+  }
+  try {
+    const value = await api.revealPassword(id);
+    app.revealed = { id, value };
+    renderPasswordList();
+    // Hide it again on its own after a while.
+    clearTimeout(app.revealTimer);
+    app.revealTimer = setTimeout(() => { if (app.revealed?.id === id) { app.revealed = null; renderPasswordList(); } }, 20000);
+  } catch (e) {
+    toast(String(e), 'error');
+  }
 }
 
 const CLEAR_AFTER = 30;
 
 async function copyPassword(id) {
+  return copySecret(() => api.revealPassword(id), 'Password');
+}
+
+/** Copy something sensitive, then clear the clipboard after a while if it still holds it. */
+async function copySecret(getText, what) {
   try {
-    const pw = await api.revealPassword(id);
-    await writeText(pw);
-    toast(`Password copied. The clipboard clears in ${CLEAR_AFTER} s.`, 'ok');
+    const text = await getText();
+    await writeText(text);
+    toast(`${what} copied. The clipboard clears in ${CLEAR_AFTER} s.`, 'ok');
     setTimeout(async () => {
       try {
-        if ((await readText()) === pw) await writeText('');
+        if ((await readText()) === text) await writeText('');
       } catch { /* clipboard changed or unavailable */ }
     }, CLEAR_AFTER * 1000);
   } catch (e) {
@@ -372,6 +535,121 @@ function generatePassword(len = 20) {
     const pw = Array.from({ length: len }, () => pick(all)).join('');
     if (sets.every((set) => [...pw].some((c) => set.includes(c)))) return pw;
   }
+}
+
+// ---------- API keys ----------
+function viewApiKeys() {
+  const d = app.data();
+  const groups = [...d.apiGroups].sort(byName);
+  if (app.apiGroupId !== 'all' && app.apiGroupId !== 'none' && !app.apiGroup(app.apiGroupId)) app.apiGroupId = 'all';
+  const count = (gid) => d.apiKeys.filter((a) => (gid === 'none' ? !a.groupId || !app.apiGroup(a.groupId) : a.groupId === gid)).length;
+  const chip = (id, label, n, color) => `<button class="chip ${app.apiGroupId === id ? 'active' : ''}" data-act="api-filter" data-id="${esc(id)}">
+      ${color ? `<span class="swatch" style="--c:${esc(color)}"></span>` : ''}${esc(label)}<span class="n">${n}</span></button>`;
+  const g = app.apiGroup(app.apiGroupId);
+  return `<div class="toolbar"><h1>API Keys</h1>
+      <label class="search">${icon.search}<input id="api-search" placeholder="Search keys, services, environments" value="${esc(app.apiSearch || '')}" spellcheck="false" autocomplete="off"></label>
+      <div class="spacer"></div>
+      <button class="btn primary" data-act="new-api">${icon.plus} Credential</button>
+      <button class="btn" data-act="new-api-group">${icon.folder} Group</button></div>
+    ${d.apiKeys.length || groups.length
+      ? `<div class="chips">${chip('all', 'All', d.apiKeys.length)}${groups.map((x) => chip(x.id, x.name, count(x.id), x.color || '#8b91a8')).join('')}${groups.length ? chip('none', 'No group', count('none')) : ''}
+          ${g ? `<button class="icon-btn" data-act="edit-api-group" data-id="${esc(g.id)}" title="Edit group">${icon.edit}</button>` : ''}</div>`
+      : ''}
+    <div id="api-results"></div>`;
+}
+
+function apiRow(a) {
+  const g = a.groupId && app.apiGroup(a.groupId);
+  const main = primaryField(a);
+  const saved = main && app.flags(a.id).fields?.includes(main.id);
+  const shown = app.revealedApi?.id === a.id ? app.revealedApi.value : null;
+  const url = entryUrl(a.baseUrl);
+  const exp = expiryInfo(a.expires);
+  const who = [a.service, identity(a)].filter(Boolean).join(' · ');
+  return `<tr class="clickable" data-api="${esc(a.id)}">
+    <td><div class="pw-name"><div class="avatar sm" style="--c:${esc(g?.color || '#14b8a6')}">${esc(initials(a.service || a.name))}</div>
+      <div><div class="title">${esc(a.name)}</div>${who ? `<div class="sub">${esc(who)}</div>` : ''}</div></div></td>
+    <td><span class="proto">${esc(API_KINDS[a.kind]?.label || 'Custom')}</span></td>
+    <td>${a.environment ? `<span class="env" style="--c:${envColor(a.environment)}">${esc(a.environment)}</span>` : '<span class="faint">—</span>'}</td>
+    <td>${!main ? '<span class="faint">—</span>' : !saved ? '<span class="danger-text">Not saved</span>'
+      : `<span class="cell-copy"><span class="mono ${shown ? 'selectable' : 'dots'}">${shown ? esc(shown) : '••••••••'}</span>
+         <button class="icon-btn" data-act="reveal-api" data-id="${esc(a.id)}" title="${shown ? 'Hide' : `Show ${esc(main.label)}`}">${icon.eye}</button>
+         <button class="icon-btn" data-act="copy-api" data-id="${esc(a.id)}" title="Copy ${esc(main.label)}">${icon.copy}</button></span>`}</td>
+    <td class="pw-url">${url ? `<a href="${esc(url)}" data-act="open-api-url" data-id="${esc(a.id)}" title="Open ${esc(url)}">${esc(a.baseUrl)}</a>` : a.baseUrl ? esc(a.baseUrl) : '<span class="faint">—</span>'}</td>
+    <td>${exp ? `<span class="exp ${exp.level}">${esc(exp.text)}</span>` : '<span class="faint">—</span>'}</td>
+    <td class="row-actions"><button class="icon-btn" data-act="api-copy-as" data-id="${esc(a.id)}" title="Copy as…">${icon.more}</button>
+      <button class="icon-btn" data-act="edit-api" data-id="${esc(a.id)}" title="Edit">${icon.edit}</button></td></tr>`;
+}
+
+function renderApiList() {
+  const r = $('#api-results');
+  if (!r) return;
+  const all = [...app.data().apiKeys].sort(byName);
+  if (!all.length) {
+    r.innerHTML = `<div class="empty"><div class="big">${icon.token}</div><h2>No API credentials yet</h2>
+      <p>Keep API keys, tokens and OAuth client secrets in one place, encrypted on this computer. Copy them as a header, a curl command or .env lines when you need them.</p>
+      <div class="row"><button class="btn primary" data-act="new-api">${icon.plus} New credential</button></div></div>`;
+    return;
+  }
+  const q = (app.apiSearch || '').trim().toLowerCase();
+  const gid = app.apiGroupId;
+  const inGroup = (a) => gid === 'all' || (gid === 'none' ? !a.groupId || !app.apiGroup(a.groupId) : a.groupId === gid);
+  const text = (a) => [a.name, a.service, a.environment, a.baseUrl, a.notes, API_KINDS[a.kind]?.label, app.apiGroup(a.groupId)?.name, ...a.fields.filter((f) => !f.secret).map((f) => f.value)];
+  const list = all.filter(inGroup).filter((a) => !q || text(a).some((v) => v && String(v).toLowerCase().includes(q)));
+  if (!list.length) {
+    r.innerHTML = `<div class="empty"><p>${q ? `Nothing matches “${esc(q)}”.` : 'No credentials in this group yet.'}</p></div>`;
+    return;
+  }
+  const groups = [...app.data().apiGroups].sort(byName);
+  const head = `<thead><tr><th>Name</th><th>Type</th><th>Environment</th><th>Secret</th><th>Base URL</th><th>Expires</th><th></th></tr></thead>`;
+  let body;
+  if (gid === 'all' && groups.length && !q) {
+    const section = (title, color, rows) => (rows.length
+      ? `<tr class="group-row"><td colspan="7">${color ? `<span class="swatch" style="--c:${esc(color)}"></span>` : ''}${esc(title)} <span class="n">${rows.length}</span></td></tr>${rows.map(apiRow).join('')}`
+      : '');
+    body = groups.map((g) => section(g.name, g.color || '#8b91a8', list.filter((a) => a.groupId === g.id))).join('') +
+      section('No group', null, list.filter((a) => !a.groupId || !app.apiGroup(a.groupId)));
+  } else body = list.map(apiRow).join('');
+  r.innerHTML = `<table class="list pw-table api-table">${head}<tbody>${body}</tbody></table>`;
+}
+
+/** Resolve any field of a saved credential, revealing secrets from the encrypted store. */
+const apiGetter = (a) => async (fid) => {
+  const f = a.fields.find((x) => x.id === fid);
+  if (!f) return null;
+  if (!f.secret) return f.value ?? null;
+  if (!app.flags(a.id).fields?.includes(fid)) return null;
+  return api.revealApiSecret(a.id, fid);
+};
+
+async function revealApi(id) {
+  if (app.revealedApi?.id === id) {
+    app.revealedApi = null;
+    return renderApiList();
+  }
+  const a = app.apiKey(id);
+  const main = a && primaryField(a);
+  if (!main) return;
+  try {
+    app.revealedApi = { id, value: await api.revealApiSecret(id, main.id) };
+    renderApiList();
+    clearTimeout(app.revealApiTimer);
+    app.revealApiTimer = setTimeout(() => { if (app.revealedApi?.id === id) { app.revealedApi = null; renderApiList(); } }, 20000);
+  } catch (e) {
+    toast(String(e), 'error');
+  }
+}
+
+function apiCopyMenu(x, y, id, inEditor = false) {
+  const a = app.apiKey(id);
+  if (!a) return;
+  const fields = a.fields.filter((f) => (f.secret ? app.flags(a.id).fields?.includes(f.id) : f.value));
+  contextMenu(x, y, [
+    ...copyFormats(a).map((f) => ({ label: `Copy as ${f.label}`, icon: icon.code, action: () => copySecret(() => buildCopy(f.id, a, apiGetter(a)), f.label) })),
+    ...(fields.length ? ['sep'] : []),
+    ...fields.map((f) => ({ label: `Copy ${f.label || f.id}`, icon: f.secret ? icon.lock : icon.copy, action: () => (f.secret ? copySecret(() => api.revealApiSecret(a.id, f.id), f.label || 'Value') : writeText(f.value).then(() => toast(`${f.label} copied`, 'ok'))) })),
+    ...(inEditor ? [] : ['sep', { label: 'Edit', icon: icon.edit, action: () => openDrawer('apikey', id) }]),
+  ]);
 }
 
 function viewKeys() {
@@ -422,16 +700,25 @@ function viewKnown() {
       : `<div class="empty"><div class="big">${icon.shield}</div><h2>Nothing trusted yet</h2><p>When you first connect to a server you'll be asked to trust its key. It shows up here.</p></div>`}`;
 }
 
+const MIN_EXPORT_PW = 10;
+
+/** Rough strength (0–4) for the export password hint: length plus character variety. */
+function pwStrength(pw) {
+  if (pw.length < MIN_EXPORT_PW) return pw ? 1 : 0;
+  const kinds = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((r) => r.test(pw)).length;
+  return Math.min(4, 1 + (pw.length >= 14) + (pw.length >= 20) + (kinds >= 3));
+}
+
 function viewTransfer() {
   const d = app.data();
   return `<div class="toolbar"><h1>Import &amp; Export</h1></div>
     <div class="panel"><h2>${icon.download.replace('<svg', '<svg style="width:15px;height:15px;vertical-align:-2px"')} Export</h2>
-      <p>Save your ${d.hosts.length} hosts, ${d.groups.length} groups, ${d.keys.length} keys, ${d.passwords.length} passwords and ${d.snippets.length} snippets to one file you can carry to another computer.</p>
-      <label class="check"><input type="checkbox" id="exp-secrets"><span>Include saved passwords and private keys
-        <small>They're encrypted inside the file with a passphrase you choose. Without this, the other computer will ask for passwords and you'll need to re-add keys.</small></span></label>
-      <div id="exp-pass" hidden style="max-width:420px">
-        <label class="field"><span>Export passphrase</span><input type="password" id="exp-p1" autocomplete="new-password"></label>
-        <label class="field"><span>Repeat passphrase</span><input type="password" id="exp-p2" autocomplete="new-password"></label>
+      <p>Save your ${d.hosts.length} hosts, ${d.groups.length} groups, ${d.keys.length} keys, ${d.passwords.length} passwords, ${d.apiKeys.length} API credentials and ${d.snippets.length} snippets to one file you can carry to another computer.</p>
+      <p class="hint">The whole file is encrypted with a password you choose here, and you'll need it to import the file. <strong>Nimbus can't recover a forgotten export password</strong>, so keep it somewhere safe.</p>
+      <div style="max-width:420px">
+        <label class="field"><span>Export password (at least ${MIN_EXPORT_PW} characters)</span><input type="password" id="exp-p1" autocomplete="new-password" spellcheck="false"></label>
+        <div class="pw-meter" id="exp-meter"><div></div></div>
+        <label class="field"><span>Repeat password</span><input type="password" id="exp-p2" autocomplete="new-password" spellcheck="false"></label>
       </div>
       <div class="row"><button class="btn primary" data-act="export">${icon.download} Export to file…</button></div>
     </div>
@@ -451,6 +738,8 @@ function viewSettings() {
   const agentHint = app.snap.platform === 'windows' ? 'Default: the OpenSSH agent pipe, then Pageant' : 'Default: $SSH_AUTH_SOCK';
   return `<div class="toolbar"><h1>Settings</h1></div>
     <form id="settings-form" class="panel" autocomplete="off">
+      <h2>Appearance</h2><p>System follows your computer's light or dark mode.</p>
+      <div class="segmented three" style="max-width:420px;margin-bottom:20px">${['system', 'light', 'dark'].map((t) => `<label><input type="radio" name="theme" value="${t}" ${(s.theme || 'system') === t ? 'checked' : ''}><span>${t[0].toUpperCase() + t.slice(1)}</span></label>`).join('')}</div>
       <h2>Terminal</h2><p>Changes apply to open terminals right away.</p>
       <div class="field-row"><label class="field"><span>Font</span><input name="fontFamily" value="${esc(s.fontFamily)}" spellcheck="false"></label>
       <label class="field"><span>Size</span><input type="number" name="fontSize" min="8" max="32" value="${s.fontSize}"></label></div>
@@ -470,6 +759,9 @@ function viewSettings() {
 function wireSettings() {
   const form = $('#settings-form');
   let t;
+  form.addEventListener('change', (e) => {
+    if (e.target.name === 'theme') applyTheme(e.target.value);
+  });
   form.addEventListener('input', () => {
     clearTimeout(t);
     t = setTimeout(async () => {
@@ -477,6 +769,7 @@ function wireSettings() {
       const num = (k, lo, hi, dflt) => Math.min(hi, Math.max(lo, parseInt(f.get(k), 10) || dflt));
       const s = {
         ...app.settings(),
+        theme: f.get('theme') || 'system',
         fontFamily: f.get('fontFamily') || app.settings().fontFamily,
         fontSize: num('fontSize', 8, 32, 13),
         cursorStyle: f.get('cursorStyle'),
@@ -501,6 +794,10 @@ function wireSettings() {
 const content = $('#content');
 
 content.addEventListener('input', (e) => {
+  if (e.target.id === 'api-search') {
+    app.apiSearch = e.target.value;
+    renderApiList();
+  }
   if (e.target.id === 'pw-search') {
     app.pwSearch = e.target.value;
     renderPasswordList();
@@ -509,10 +806,14 @@ content.addEventListener('input', (e) => {
     app.search = e.target.value;
     renderResults();
   }
-  if (e.target.id === 'exp-secrets') $('#exp-pass').hidden = !e.target.checked;
+  if (e.target.id === 'exp-p1') {
+    const n = pwStrength(e.target.value);
+    const meter = $('#exp-meter');
+    meter.dataset.level = n;
+    meter.title = ['', 'Too short', 'OK', 'Good', 'Strong'][n];
+  }
 });
 content.addEventListener('change', (e) => {
-  if (e.target.id === 'exp-secrets') $('#exp-pass').hidden = !e.target.checked;
 });
 
 content.addEventListener('keydown', async (e) => {
@@ -529,25 +830,29 @@ content.addEventListener('keydown', async (e) => {
   const quick = QUICK.exec(q);
   if (hits.length === 1 && !q.includes('@')) return app.connect(hits[0].id);
   if (!quick) return;
-  const [, user, addr, port] = quick;
+  const [, scheme = 'ssh', user, addr, port] = quick;
+  const protocol = { ssh: 'ssh', sftp: 'ssh', ftp: 'ftp', ftps: 'ftps' }[scheme.toLowerCase()];
+  const files = scheme.toLowerCase() === 'sftp';
   const address = addr.replace(/^\[|\]$/g, '');
-  const existing = app.data().hosts.find((h) => h.address === address && (!user || h.username === user) && (!port || h.port === +port));
-  if (existing) return app.connect(existing.id);
-  const host = { id: uid(), label: address, protocol: 'ssh', address, username: user || null, port: port ? +port : null, useAgent: true, tags: [] };
+  const go = (id) => (files ? app.openFiles(id) : app.connect(id));
+  const existing = app.data().hosts.find((h) => h.address === address && (h.protocol || 'ssh') === protocol && (!user || h.username === user) && (!port || h.port === +port));
+  if (existing) return go(existing.id);
+  const host = { id: uid(), label: address, protocol, address, username: user || null, port: port ? +port : null, useAgent: true, tags: [] };
   if (await run(() => api.saveHost(host, null))) {
     app.search = '';
     renderContent();
-    app.connect(host.id);
+    go(host.id);
   }
 });
 
 content.addEventListener('click', async (e) => {
   const actEl = e.target.closest('[data-act]');
   if (actEl) {
+    e.preventDefault();
     e.stopPropagation();
-    return onAction(actEl.dataset.act, actEl.dataset.id);
+    return onAction(actEl.dataset.act, actEl.dataset.id, actEl);
   }
-  const card = e.target.closest('.card');
+  const card = e.target.closest('.card, .hrow');
   if (!card) return;
   if (card.dataset.host) app.connect(card.dataset.host);
   else if (card.dataset.group) { app.groupId = card.dataset.group; app.search = ''; renderContent(); }
@@ -555,15 +860,30 @@ content.addEventListener('click', async (e) => {
   else if (card.dataset.snippet) openDrawer('snippet', card.dataset.snippet);
   else if (card.dataset.password) openDrawer('password', card.dataset.password);
 });
+content.addEventListener('click', (e) => {
+  // Password rows are table rows rather than cards.
+  if (e.target.closest('[data-act], a, .selectable')) return;
+  const row = e.target.closest('tr[data-password]');
+  if (row) openDrawer('password', row.dataset.password);
+  const apiRowEl = e.target.closest('tr[data-api]');
+  if (apiRowEl) openDrawer('apikey', apiRowEl.dataset.api);
+});
 
 content.addEventListener('contextmenu', (e) => {
-  const card = e.target.closest('.card');
+  const apiRowEl = e.target.closest('tr[data-api]');
+  if (apiRowEl && !e.target.closest('.selectable')) {
+    e.preventDefault();
+    return apiCopyMenu(e.clientX, e.clientY, apiRowEl.dataset.api);
+  }
+  const card = e.target.closest('.card, .hrow');
   if (!card) return;
   e.preventDefault();
   if (card.dataset.host) {
     const id = card.dataset.host;
+    const h = app.host(id);
     contextMenu(e.clientX, e.clientY, [
-      { label: 'Connect', icon: icon.play, action: () => app.connect(id) },
+      { label: isSsh(h) ? 'Connect' : 'Open files', icon: isSsh(h) ? icon.play : icon.folder, action: () => app.connect(id) },
+      ...(isSsh(h) ? [{ label: 'Open SFTP', icon: icon.folder, action: () => app.openFiles(id) }] : []),
       { label: 'Edit', icon: icon.edit, action: () => openDrawer('host', id) },
       { label: 'Duplicate', icon: icon.copy, action: () => run(() => api.duplicateHost(id)) },
       'sep',
@@ -580,8 +900,44 @@ content.addEventListener('contextmenu', (e) => {
   }
 });
 
-async function onAction(act, id) {
+async function onAction(act, id, el) {
   switch (act) {
+    case 'api-filter': app.apiGroupId = id; app.revealedApi = null; return renderContent();
+    case 'new-api': return openDrawer('apikey', null);
+    case 'edit-api': return openDrawer('apikey', id);
+    case 'new-api-group': return openDrawer('apigroup', null);
+    case 'edit-api-group': return openDrawer('apigroup', id);
+    case 'reveal-api': return revealApi(id);
+    case 'copy-api': {
+      const a = app.apiKey(id);
+      const main = a && primaryField(a);
+      if (main) copySecret(() => api.revealApiSecret(id, main.id), main.label);
+      return;
+    }
+    case 'api-copy-as': {
+      const r = el.getBoundingClientRect();
+      return apiCopyMenu(r.left, r.bottom + 4, id);
+    }
+    case 'open-api-url': {
+      const url = entryUrl(app.apiKey(id)?.baseUrl);
+      if (url) openUrl(url).catch((e) => toast(String(e), 'error'));
+      return;
+    }
+    case 'sftp': return app.openFiles(id);
+    case 'hosts-view':
+      // Saved with the settings, so the Hosts screen reopens the way it was left.
+      if (hostsView() !== id) run(() => api.saveSettings({ ...app.settings(), hostsView: id }));
+      return;
+    case 'pw-filter': app.pwGroupId = id; app.revealed = null; return renderContent();
+    case 'new-pw-group': return openDrawer('pwgroup', null);
+    case 'edit-pw-group': return openDrawer('pwgroup', id);
+    case 'edit-password': return openDrawer('password', id);
+    case 'reveal-pass': return revealPassword(id);
+    case 'open-url': {
+      const url = entryUrl(app.password(id)?.url);
+      if (url) openUrl(url).catch((e) => toast(String(e), 'error'));
+      return;
+    }
     case 'new-host': return openDrawer('host', null);
     case 'edit-host': return openDrawer('host', id);
     case 'new-group': return openDrawer('group', null);
@@ -634,49 +990,62 @@ async function deleteGroup(id) {
 
 // ---------- import / export ----------
 async function doExport() {
-  const withSecrets = $('#exp-secrets').checked;
-  let pass = null;
-  if (withSecrets) {
-    pass = $('#exp-p1').value;
-    if (pass.length < 8) return toast('Use a passphrase of at least 8 characters', 'error');
-    if (pass !== $('#exp-p2').value) return toast('The two passphrases don’t match', 'error');
-  }
+  const pass = $('#exp-p1').value;
+  if (pass.length < MIN_EXPORT_PW) return toast(`Use an export password of at least ${MIN_EXPORT_PW} characters`, 'error');
+  if (pass !== $('#exp-p2').value) return toast('The two passwords don’t match', 'error');
   const date = new Date().toISOString().slice(0, 10);
-  const path = await saveDialog({ defaultPath: `nimbus-export-${date}.json`, filters: [{ name: 'Nimbus export', extensions: ['json'] }] });
+  const path = await saveDialog({ defaultPath: `nimbus-export-${date}.nimbus.json`, filters: [{ name: 'Nimbus export', extensions: ['json'] }] });
   if (!path) return;
   if (await run(() => api.exportData(path, pass))) {
-    toast(withSecrets ? 'Exported, with passwords and keys encrypted' : 'Exported (without passwords or keys)', 'ok');
+    $('#exp-p1').value = $('#exp-p2').value = '';
+    $('#exp-meter').dataset.level = 0;
+    toast('Exported and encrypted. You’ll need the password to import it.', 'ok');
   }
 }
 
 async function doImport() {
   const path = await openDialog({ multiple: false, filters: [{ name: 'Nimbus export', extensions: ['json'] }] });
   if (!path) return;
-  let p;
-  try {
-    p = await api.importPreview(path);
-  } catch (e) {
-    return toast(String(e), 'error');
+  // 1. The password: checked by decrypting the file before anything is shown or changed.
+  let password = '';
+  let p = null;
+  let error = '';
+  while (!p) {
+    const r = await modal({
+      title: 'Unlock the export',
+      html: `<p>Enter the password this file was exported with.</p>
+        <label class="field"><input type="password" name="pass" autofocus spellcheck="false" autocomplete="off"></label>
+        ${error ? `<div class="dangerbox">${esc(error)}</div>` : ''}`,
+      buttons: [{ label: 'Cancel', value: 'cancel' }, { label: 'Unlock', value: 'ok', kind: 'primary', submit: true }],
+    });
+    if (r.action !== 'ok') return;
+    password = r.values.pass || '';
+    try {
+      toast('Decrypting…');
+      p = await api.importPreview(path, password);
+    } catch (e) {
+      error = String(e);
+      // Problems other than the password (not an export, damaged, too new) won't fix themselves.
+      if (!/password/i.test(error)) return toast(error, 'error');
+    }
   }
+  // 2. What's in it, and how to bring it in.
   const r = await modal({
-    title: 'Import hosts',
+    title: 'Import',
     html: `<p>This file was exported ${esc(new Date(p.exportedAt).toLocaleString())} and contains
         <strong>${p.hosts}</strong> hosts, <strong>${p.groups}</strong> groups, <strong>${p.keys}</strong> keys,
-        <strong>${p.passwords}</strong> passwords, <strong>${p.snippets}</strong> snippets and <strong>${p.knownHosts}</strong> trusted host keys.</p>
+        <strong>${p.passwords}</strong> passwords, <strong>${p.apiKeys}</strong> API credentials, <strong>${p.snippets}</strong> snippets and <strong>${p.knownHosts}</strong> trusted host keys.</p>
       <div class="radio-cards">
         <label><input type="radio" name="mode" value="merge" checked><span>Merge<small>Add what's new and update anything imported before. Nothing is removed.</small></span></label>
-        <label><input type="radio" name="mode" value="replace"><span>Replace everything<small>Your current hosts, groups, keys, passwords and snippets are replaced by the file.</small></span></label>
-      </div>
-      ${p.hasSecrets
-        ? `<label class="field"><span>Passphrase for passwords and keys</span><input type="password" name="pass" autofocus placeholder="Leave empty to import without them"></label>`
-        : '<p class="hint">This file has no passwords or private keys in it.</p>'}`,
+        <label><input type="radio" name="mode" value="replace"><span>Replace everything<small>Your current hosts, groups, keys, passwords, API credentials and snippets are replaced by the file.</small></span></label>
+      </div>`,
     buttons: [{ label: 'Cancel', value: 'cancel' }, { label: 'Import', value: 'ok', kind: 'primary', submit: true }],
   });
   if (r.action !== 'ok') return;
-  if (r.values.mode === 'replace' && !(await confirmDialog('Replace everything?', 'Your current hosts, groups, keys and snippets will be replaced. Consider exporting them first.', 'Replace'))) return;
-  const ok = await run(() => api.importApply(path, r.values.mode, r.values.pass || null));
+  if (r.values.mode === 'replace' && !(await confirmDialog('Replace everything?', 'Your current hosts, groups, keys, passwords, API credentials and snippets will be replaced. Consider exporting them first.', 'Replace'))) return;
+  const ok = await run(() => api.importApply(path, r.values.mode, password));
   if (ok) {
-    toast(`Imported ${p.hosts} hosts${p.hasSecrets && !r.values.pass ? ' (without passwords or keys)' : ''}`, 'ok');
+    toast(`Imported ${p.hosts} hosts, ${p.passwords} passwords and ${p.apiKeys} API credentials`, 'ok');
     app.view = 'hosts';
     app.groupId = null;
     renderSidebar();
@@ -706,7 +1075,7 @@ const drawer = $('#drawer');
 function openDrawer(kind, id) {
   app.drawer = { kind, id };
   drawer.hidden = false;
-  drawer.innerHTML = { host: hostForm, group: groupForm, key: keyForm, snippet: snippetForm, password: passwordForm }[kind](id);
+  drawer.innerHTML = { host: hostForm, group: groupForm, key: keyForm, snippet: snippetForm, password: passwordForm, pwgroup: pwGroupForm, apigroup: apiGroupForm, apikey: apiKeyForm }[kind](id);
   wireDrawer(kind, id);
   drawer.querySelector('[autofocus]')?.focus();
 }
@@ -733,27 +1102,54 @@ function drawerShell(title, body, foot) {
 }
 
 function hostForm(id) {
-  const h = (id && app.host(id)) || { groupId: app.groupId, useAgent: true, tags: [] };
+  const h = (id && app.host(id)) || { groupId: app.groupId, useAgent: true, tags: [], protocol: 'ssh' };
   const d = app.data();
   const g = h.groupId && app.group(h.groupId);
   const hasPw = id && app.flags(id).password;
+  const proto = h.protocol || 'ssh';
+  const protoOpt = (v, label, sub) => `<label><input type="radio" name="protocol" value="${v}" ${proto === v ? 'checked' : ''}><span>${label}<small>${sub}</small></span></label>`;
   return drawerShell(
     id ? 'Edit host' : 'New host',
-    `<div class="fieldset"><div class="legend">Address</div>
+    `<div class="fieldset"><div class="legend">Connection</div>
+      <div class="segmented four">${protoOpt('ssh', 'SSH', 'Terminal + SFTP')}${protoOpt('serial', 'Serial', 'USB / COM')}${protoOpt('ftp', 'FTP', 'Files')}${protoOpt('ftps', 'FTPS', 'Encrypted')}</div>
+      <p class="hint proto-hint" data-for="serial">A device on a serial port: a router or switch console cable, an Arduino, a USB-serial adapter.</p>
+      <p class="hint proto-hint" data-for="ftp">Plain FTP sends your password and files unencrypted. Use FTPS, or SSH (SFTP), when the server supports it.</p>
+      <p class="hint proto-hint" data-for="ftps">FTP with TLS (“explicit FTPS”). If the server's certificate isn't from a known authority, you'll be asked to trust it once.</p>
+    </div>
+    <div class="fieldset"><div class="legend">Address</div>
       <label class="field"><span>Label</span><input name="label" value="${esc(h.label)}" placeholder="e.g. Web server" autofocus></label>
-      <div class="field-row"><label class="field"><span>Hostname or IP</span><input name="address" value="${esc(h.address)}" placeholder="server.example.com" spellcheck="false"></label>
-      <label class="field"><span>Port</span><input type="number" name="port" min="1" max="65535" value="${h.port ?? ''}" placeholder="${g?.port || 22}"></label></div>
+      <div class="field-row net-only"><label class="field"><span>Hostname or IP</span><input name="address" value="${esc(h.address)}" placeholder="server.example.com" spellcheck="false"></label>
+      <label class="field"><span>Port</span><input type="number" name="port" min="1" max="65535" value="${h.port ?? ''}" data-ssh-port="${g?.port || 22}" placeholder="${proto === 'ssh' ? g?.port || 22 : 21}"></label></div>
       <label class="field"><span>Group</span><select name="groupId">${opt('', 'No group', !h.groupId)}${[...d.groups].sort(byName).map((x) => opt(x.id, x.name, x.id === h.groupId)).join('')}</select></label>
     </div>
+    <div class="fieldset serial-only"><div class="legend">Serial port</div>
+      <label class="field"><span>Port</span><div class="input-row"><input name="serialPort" list="serial-ports" value="${esc(isSerial(h) ? h.address : '')}" placeholder="${app.snap.platform === 'windows' ? 'COM3' : '/dev/cu.usbserial-…'}" spellcheck="false">
+        <button type="button" class="btn small" data-dact="scan-ports" title="Look for connected devices">${icon.refresh} Scan</button></div></label>
+      <datalist id="serial-ports"></datalist>
+      <p class="hint ports-hint" style="margin:-4px 0 10px"></p>
+      <div class="field-grid">
+        <label class="field"><span>Baud rate</span><input type="number" name="baudRate" list="bauds" min="50" max="4000000" value="${h.baudRate ?? ''}" placeholder="9600"></label>
+        <datalist id="bauds">${BAUDS.map((b) => `<option value="${b}">`).join('')}</datalist>
+        <label class="field"><span>Data bits</span><select name="dataBits">${[8, 7, 6, 5].map((b) => opt(b, b, (h.dataBits || 8) === b)).join('')}</select></label>
+        <label class="field"><span>Parity</span><select name="parity">${[['none', 'None'], ['even', 'Even'], ['odd', 'Odd']].map(([v, l]) => opt(v, l, (h.parity || 'none') === v)).join('')}</select></label>
+        <label class="field"><span>Stop bits</span><select name="stopBits">${[1, 2].map((b) => opt(b, b, (h.stopBits || 1) === b)).join('')}</select></label>
+        <label class="field"><span>Flow control</span><select name="flowControl">${[['none', 'None'], ['hardware', 'Hardware (RTS/CTS)'], ['software', 'Software (XON/XOFF)']].map(([v, l]) => opt(v, l, (h.flowControl || 'none') === v)).join('')}</select></label>
+        <label class="field"><span>Enter sends</span><select name="newline">${[['cr', 'CR (\\r)'], ['lf', 'LF (\\n)'], ['crlf', 'CR LF']].map(([v, l]) => opt(v, l, (h.newline || 'cr') === v)).join('')}</select></label>
+      </div>
+      <label class="check"><input type="checkbox" name="localEcho" ${h.localEcho ? 'checked' : ''}><span>Local echo<small>Show what you type, for devices that don't echo it back.</small></span></label>
+      <p class="hint">Most network gear uses 9600 8N1. Arduinos and many boards use 115200.</p>
+    </div>
     <div class="fieldset"><div class="legend">Login</div>
-      <label class="field"><span>Username</span><input name="username" value="${esc(h.username || '')}" placeholder="${esc(g?.username || 'Ask when connecting')}" spellcheck="false"></label>
-      <label class="field"><span>Password</span><input type="password" name="password" placeholder="${hasPw ? '•••••••• saved — type to change' : 'Optional — asked when needed'}" autocomplete="new-password"></label>
+      <label class="field net-only"><span>Username</span><input name="username" value="${esc(h.username || '')}" data-ssh-ph="${esc(g?.username || 'Ask when connecting')}" data-ftp-ph="${esc(g?.username || 'anonymous')}" placeholder="${esc(proto === 'ssh' ? g?.username || 'Ask when connecting' : g?.username || 'anonymous')}" spellcheck="false"></label>
+      <label class="field"><span>Password</span><input type="password" name="password" data-net-ph="${hasPw ? '•••••••• saved — type to change' : 'Optional — asked when needed'}" data-serial-ph="${hasPw ? '•••••••• saved — type to change' : `Optional — for Type password (${isMac ? '⌘⇧P' : 'Ctrl+Shift+P'})`}" placeholder="${hasPw ? '•••••••• saved — type to change' : 'Optional — asked when needed'}" autocomplete="new-password"></label>
       ${hasPw ? `<label class="check"><input type="checkbox" name="clearPassword"><span>Forget saved password</span></label>` : ''}
+      <div class="ssh-only">
       <label class="field"><span>Key</span><select name="keyId">${opt('', g?.keyId ? `From group (${app.key(g.keyId)?.label || 'key'})` : 'None', !h.keyId)}${[...d.keys].sort(byName).map((k) => opt(k.id, k.label, k.id === h.keyId)).join('')}</select></label>
       <label class="check"><input type="checkbox" name="useAgent" ${h.useAgent !== false ? 'checked' : ''}><span>Try keys from my SSH agent<small>ssh-agent, 1Password, Secretive, Pageant…</small></span></label>
+      </div>
     </div>
-    <div class="fieldset"><div class="legend">Jump host</div>
-      <label class="field"><select name="jumpHostId">${opt('', 'Connect directly', !h.jumpHostId)}${d.hosts.filter((x) => x.id !== id).sort(byName).map((x) => opt(x.id, `Via ${x.label}`, x.id === h.jumpHostId)).join('')}</select></label>
+    <div class="fieldset ssh-only"><div class="legend">Jump host</div>
+      <label class="field"><select name="jumpHostId">${opt('', 'Connect directly', !h.jumpHostId)}${d.hosts.filter((x) => x.id !== id && isSsh(x)).sort(byName).map((x) => opt(x.id, `Via ${x.label}`, x.id === h.jumpHostId)).join('')}</select></label>
     </div>
     <div class="fieldset"><div class="legend">Appearance</div>${swatches('color', h.color)}</div>
     <div class="fieldset"><div class="legend">Notes</div>
@@ -761,7 +1157,7 @@ function hostForm(id) {
       <label class="field"><textarea class="short" name="notes" placeholder="Anything worth remembering">${esc(h.notes || '')}</textarea></label>
     </div>`,
     `${id ? `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button>` : ''}<div class="spacer"></div>
-     <button type="button" class="btn" data-dact="save-connect">${icon.play} Connect</button>
+     <button type="button" class="btn" data-dact="save-connect">${proto === 'ssh' || proto === 'serial' ? `${icon.play} Connect` : `${icon.folder} Open`}</button>
      <button type="submit" class="btn primary">Save</button>`,
   );
 }
@@ -816,12 +1212,14 @@ function keyForm(id) {
 }
 
 function passwordForm(id) {
-  const p = (id && app.password(id)) || {};
+  const fromFilter = app.pwGroup(app.pwGroupId) ? app.pwGroupId : null;
+  const p = (id && app.password(id)) || { groupId: fromFilter };
   const saved = id && app.flags(id).password;
   return drawerShell(
     id ? 'Edit password' : 'New password',
     `<div class="fieldset">
       <label class="field"><span>Name</span><input name="name" value="${esc(p.name)}" placeholder="e.g. Ubuntu sudo, Router admin" autofocus></label>
+      <label class="field"><span>Group</span><select name="groupId">${opt('', 'No group', !p.groupId)}${[...app.data().passwordGroups].sort(byName).map((g) => opt(g.id, g.name, g.id === p.groupId)).join('')}</select></label>
       <label class="field"><span>Username</span><input name="username" value="${esc(p.username || '')}" spellcheck="false"></label>
       <label class="field"><span>Password</span><input type="password" name="password" placeholder="${saved ? '•••••••• saved — type to change' : ''}" autocomplete="new-password" spellcheck="false"></label>
       <div class="inline-actions" style="margin:-4px 0 12px">
@@ -829,11 +1227,97 @@ function passwordForm(id) {
           <button type="button" class="btn small" data-dact="pw-copy">${icon.copy} Copy</button>` : ''}
         <button type="button" class="btn small" data-dact="pw-gen">${icon.dice} Generate</button>
       </div>
-      <label class="field"><span>Website or address</span><input name="url" value="${esc(p.url || '')}" spellcheck="false"></label>
+      <label class="field"><span>Website or address</span><input name="url" value="${esc(p.url || '')}" placeholder="e.g. example.com or 192.168.1.1" spellcheck="false"></label>
       <label class="field"><span>Notes</span><textarea class="short" name="notes">${esc(p.notes || '')}</textarea></label>
       ${p.updated ? `<p class="hint">Last changed ${esc(timeAgo(p.updated))}</p>` : ''}
     </div>`,
     `${id ? `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button>` : ''}<div class="spacer"></div>
+     <button type="button" class="btn" data-dact="close">Cancel</button><button type="submit" class="btn primary">Save</button>`,
+  );
+}
+
+function pwGroupForm(id) {
+  const g = (id && app.pwGroup(id)) || {};
+  const n = id ? app.data().passwords.filter((p) => p.groupId === id).length : 0;
+  return drawerShell(
+    id ? 'Edit password group' : 'New password group',
+    `<div class="fieldset"><label class="field"><span>Name</span><input name="name" value="${esc(g.name)}" placeholder="e.g. Servers, Network gear, Websites" autofocus></label>
+      <div class="legend" style="margin-top:14px">Colour</div>${swatches('color', g.color)}
+      ${id ? `<p class="hint" style="margin-top:14px">${n} password${n === 1 ? '' : 's'} in this group.</p>` : ''}</div>`,
+    `${id ? `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button>` : ''}<div class="spacer"></div>
+     <button type="button" class="btn" data-dact="close">Cancel</button><button type="submit" class="btn primary">Save</button>`,
+  );
+}
+
+function apiGroupForm(id) {
+  const g = (id && app.apiGroup(id)) || {};
+  const n = id ? app.data().apiKeys.filter((a) => a.groupId === id).length : 0;
+  return drawerShell(
+    id ? 'Edit API group' : 'New API group',
+    `<div class="fieldset"><label class="field"><span>Name</span><input name="name" value="${esc(g.name)}" placeholder="e.g. Payments, Cloud, Internal APIs" autofocus></label>
+      <div class="legend" style="margin-top:14px">Colour</div>${swatches('color', g.color)}
+      ${id ? `<p class="hint" style="margin-top:14px">${n} credential${n === 1 ? '' : 's'} in this group.</p>` : ''}</div>`,
+    `${id ? `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button>` : ''}<div class="spacer"></div>
+     <button type="button" class="btn" data-dact="close">Cancel</button><button type="submit" class="btn primary">Save</button>`,
+  );
+}
+
+/** One field row in the credential editor. Template fields have a fixed label; extra ones are editable. */
+function apiFieldHtml(f, entryId, extra) {
+  const saved = entryId && f.secret && app.flags(entryId).fields?.includes(f.id);
+  const input = f.options
+    ? `<select data-fv>${f.options.map(([v, l]) => opt(v, l, (f.value || f.options[0][0]) === v)).join('')}</select>`
+    : `<input data-fv type="${f.secret ? 'password' : 'text'}" value="${esc(f.secret ? '' : f.value || '')}" spellcheck="false" autocomplete="off"
+        placeholder="${esc(saved ? '•••••••• saved — type to change' : f.placeholder || (f.optional ? 'Optional' : ''))}">`;
+  return `<div class="api-field" data-fid="${esc(f.id)}" data-secret="${f.secret ? 1 : 0}" ${extra ? 'data-extra="1"' : ''}>
+    ${extra
+      ? `<div class="api-field-head"><input data-fl value="${esc(f.label || '')}" placeholder="Field name" spellcheck="false">
+          <label class="mini-check" title="Store encrypted and hide it"><input type="checkbox" data-fs ${f.secret ? 'checked' : ''}> Secret</label>
+          <button type="button" class="icon-btn" data-dact="api-del-field" title="Remove field">${icon.x}</button></div>`
+      : `<span class="api-field-label">${esc(f.label)}${f.secret ? ` <span class="lock" title="Stored encrypted">${icon.lock}</span>` : ''}</span>`}
+    <div class="input-row">${input}
+      ${f.secret ? `<button type="button" class="icon-btn" data-dact="api-show" title="Show">${icon.eye}</button>` : ''}
+      ${saved ? `<button type="button" class="icon-btn" data-dact="api-copy-field" title="Copy">${icon.copy}</button>
+        <button type="button" class="icon-btn" data-dact="api-clear" title="Forget the saved value">${icon.trash}</button>` : ''}</div></div>`;
+}
+
+/** The fields for a credential of `kind`: the type's own fields, then any extra ones. */
+function apiFieldsFor(kind, entry) {
+  const tpl = API_KINDS[kind]?.fields || [];
+  const existing = new Map((entry?.fields || []).map((f) => [f.id, f]));
+  const fixed = tpl.map((t) => ({ ...t, value: existing.get(t.id)?.value ?? null }));
+  const extras = (entry?.fields || []).filter((f) => !tpl.some((t) => t.id === f.id) && (kind === 'custom' || !Object.values(API_KINDS).some((k) => k.fields.some((t) => t.id === f.id))));
+  return { fixed, extras };
+}
+
+function apiKeyForm(id) {
+  const fromFilter = app.apiGroup(app.apiGroupId) ? app.apiGroupId : null;
+  const a = (id && app.apiKey(id)) || { kind: 'apiKey', groupId: fromFilter, fields: [] };
+  const exp = a.expires ? new Date(a.expires - new Date(a.expires).getTimezoneOffset() * 60000).toISOString().slice(0, 10) : '';
+  return drawerShell(
+    id ? 'Edit API credential' : 'New API credential',
+    `<div class="fieldset">
+      <label class="field"><span>Name</span><input name="name" value="${esc(a.name)}" placeholder="e.g. GitHub deploy token" autofocus></label>
+      <div class="field-grid">
+        <label class="field"><span>Service</span><input name="service" value="${esc(a.service || '')}" placeholder="e.g. Stripe" spellcheck="false"></label>
+        <label class="field"><span>Environment</span><input name="environment" list="api-envs" value="${esc(a.environment || '')}" placeholder="None" spellcheck="false"></label>
+      </div>
+      <datalist id="api-envs">${ENVIRONMENTS.map((e) => `<option value="${e}">`).join('')}</datalist>
+      <label class="field"><span>Group</span><select name="groupId">${opt('', 'No group', !a.groupId)}${[...app.data().apiGroups].sort(byName).map((g) => opt(g.id, g.name, g.id === a.groupId)).join('')}</select></label>
+    </div>
+    <div class="fieldset"><div class="legend">Credential</div>
+      <label class="field"><span>Type</span><select name="kind">${Object.entries(API_KINDS).map(([k, v]) => opt(k, v.label, a.kind === k)).join('')}</select></label>
+      <div class="api-fields"></div>
+      <button type="button" class="btn small" data-dact="api-add-field">${icon.plus} Add field</button>
+    </div>
+    <div class="fieldset"><div class="legend">Details</div>
+      <label class="field"><span>Base URL</span><input name="baseUrl" value="${esc(a.baseUrl || '')}" placeholder="https://api.example.com" spellcheck="false"></label>
+      <label class="field"><span>Expires</span><input type="date" name="expires" value="${exp}"></label>
+      <label class="field"><span>Notes</span><textarea class="short" name="notes" placeholder="Scopes, who owns it, where it's used…">${esc(a.notes || '')}</textarea></label>
+      ${a.updated ? `<p class="hint">Last changed ${esc(timeAgo(a.updated))}</p>` : ''}
+    </div>`,
+    `${id ? `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button>` : ''}
+     ${id ? `<button type="button" class="btn" data-dact="api-copy-as">${icon.more} Copy as</button>` : ''}<div class="spacer"></div>
      <button type="button" class="btn" data-dact="close">Cancel</button><button type="submit" class="btn primary">Save</button>`,
   );
 }
@@ -852,21 +1336,36 @@ function snippetForm(id) {
 
 function wireDrawer(kind, id) {
   const form = drawer.querySelector('form');
+  let scanPorts = null; // host form: refreshes the serial port suggestions
   const val = (n) => form.elements[n]?.value?.trim() ?? '';
   const checked = (n) => !!form.elements[n]?.checked;
   const num = (n) => (val(n) ? Math.min(65535, Math.max(1, parseInt(val(n), 10))) || null : null);
 
   async function save(connectAfter = false) {
     if (kind === 'host') {
-      if (!val('address')) return toast('Enter a hostname or IP address', 'error');
       const prev = (id && app.host(id)) || {};
+      const protocol = form.querySelector('input[name=protocol]:checked')?.value || 'ssh';
+      const serial = protocol === 'serial';
+      if (serial && !val('serialPort')) return toast('Choose or type a serial port', 'error');
+      if (!serial && !val('address')) return toast('Enter a hostname or IP address', 'error');
       const host = {
         ...prev,
         id: id || uid(),
-        protocol: prev.protocol || 'ssh',
+        protocol,
         label: val('label'),
-        address: val('address'),
-        port: num('port'),
+        address: serial ? val('serialPort') : val('address'),
+        port: serial ? null : num('port'),
+        ...(serial
+          ? {
+              baudRate: parseInt(val('baudRate'), 10) || null,
+              dataBits: +val('dataBits'),
+              parity: val('parity'),
+              stopBits: +val('stopBits'),
+              flowControl: val('flowControl'),
+              newline: val('newline'),
+              localEcho: checked('localEcho'),
+            }
+          : {}),
         groupId: val('groupId') || null,
         username: val('username') || null,
         keyId: val('keyId') || null,
@@ -896,15 +1395,104 @@ function wireDrawer(kind, id) {
     } else if (kind === 'password') {
       if (!val('name')) return toast('Give the password a name', 'error');
       const prev = (id && app.password(id)) || {};
-      const entry = { ...prev, id: id || uid(), name: val('name'), username: val('username') || null, url: val('url') || null, notes: form.elements.notes.value.trim() || null, updated: 0 };
+      const entry = { ...prev, id: id || uid(), name: val('name'), groupId: val('groupId') || null, username: val('username') || null, url: val('url') || null, notes: form.elements.notes.value.trim() || null, updated: 0 };
       const pw = form.elements.password.value;
       if (!id && !pw) return toast('Enter or generate a password', 'error');
       if (await run(() => api.savePassword(entry, pw || null), 'Password saved')) closeDrawer();
+    } else if (kind === 'apigroup') {
+      if (!val('name')) return toast('Give the group a name', 'error');
+      const group = { id: id || uid(), name: val('name'), color: form.querySelector('input[name=color]:checked')?.value || null };
+      if (await run(() => api.saveApiGroup(group), 'Group saved')) {
+        closeDrawer();
+        if (!id) { app.apiGroupId = group.id; renderContent(); }
+      }
+    } else if (kind === 'apikey') {
+      if (!val('name')) return toast('Give the credential a name', 'error');
+      const fields = [];
+      const secrets = {};
+      for (const row of form.querySelectorAll('.api-field')) {
+        const fid = row.dataset.fid;
+        const extra = !!row.dataset.extra;
+        const secret = extra ? row.querySelector('[data-fs]').checked : row.dataset.secret === '1';
+        const label = extra ? row.querySelector('[data-fl]').value.trim() : row.querySelector('.api-field-label').textContent.trim();
+        const v = row.querySelector('[data-fv]').value;
+        if (extra && !label && !v) continue;
+        fields.push({ id: fid, label: label || 'Field', secret, value: secret ? null : v.trim() || null });
+        if (secret) secrets[fid] = row.dataset.clear ? '' : v ? v : null;
+      }
+      const prev = (id && app.apiKey(id)) || {};
+      const day = val('expires');
+      const entry = {
+        ...prev, id: id || uid(), name: val('name'), kind: val('kind'), service: val('service') || null, environment: val('environment') || null,
+        groupId: val('groupId') || null, baseUrl: val('baseUrl') || null, notes: form.elements.notes.value.trim() || null,
+        // End of the chosen day, local time.
+        expires: day ? new Date(`${day}T23:59:59`).getTime() : null, fields, updated: 0,
+      };
+      if (await run(() => api.saveApiKey(entry, secrets), 'Credential saved')) closeDrawer();
+    } else if (kind === 'pwgroup') {
+      if (!val('name')) return toast('Give the group a name', 'error');
+      const group = { id: id || uid(), name: val('name'), color: form.querySelector('input[name=color]:checked')?.value || null };
+      if (await run(() => api.savePasswordGroup(group), 'Group saved')) {
+        closeDrawer();
+        if (!id) { app.pwGroupId = group.id; renderContent(); }
+      }
     } else if (kind === 'snippet') {
       if (!val('command')) return toast('Enter a command', 'error');
       const snippet = { id: id || uid(), name: val('name'), command: form.elements.command.value.replace(/\s+$/, ''), run: checked('run') };
       if (await run(() => api.saveSnippet(snippet), 'Snippet saved')) closeDrawer();
     }
+  }
+
+  if (kind === 'apikey') {
+    const box = form.querySelector('.api-fields');
+    const draw = () => {
+      // Keep anything already typed when switching type, for fields both types share.
+      const typed = new Map([...box.querySelectorAll('.api-field')].map((r) => [r.dataset.fid, r.querySelector('[data-fv]').value]));
+      const entry = (id && app.apiKey(id)) || { fields: [] };
+      const { fixed, extras } = apiFieldsFor(form.elements.kind.value, entry);
+      box.innerHTML = fixed.map((f) => apiFieldHtml(f, id, false)).join('') + extras.map((f) => apiFieldHtml(f, id, true)).join('');
+      for (const r of box.querySelectorAll('.api-field')) {
+        const v = typed.get(r.dataset.fid);
+        if (v) r.querySelector('[data-fv]').value = v;
+      }
+    };
+    form.elements.kind.addEventListener('change', draw);
+    draw();
+  }
+
+  if (kind === 'host') {
+    // Show only the fields that apply to the chosen protocol.
+    const sync = () => {
+      const proto = form.querySelector('input[name=protocol]:checked')?.value || 'ssh';
+      form.querySelectorAll('.ssh-only').forEach((el) => (el.hidden = proto !== 'ssh'));
+      form.querySelectorAll('.net-only').forEach((el) => (el.hidden = proto === 'serial'));
+      form.querySelectorAll('.serial-only').forEach((el) => (el.hidden = proto !== 'serial'));
+      form.elements.password.placeholder = proto === 'serial' ? form.elements.password.dataset.serialPh : form.elements.password.dataset.netPh;
+      if (proto === 'serial' && !scanned) { scanned = true; scanPorts(); }
+      form.querySelectorAll('.proto-hint').forEach((el) => (el.hidden = el.dataset.for !== proto));
+      form.elements.port.placeholder = proto === 'ssh' ? form.elements.port.dataset.sshPort : '21';
+      form.elements.username.placeholder = proto === 'ssh' ? form.elements.username.dataset.sshPh : form.elements.username.dataset.ftpPh;
+      const btn = form.querySelector('[data-dact=save-connect]');
+      btn.innerHTML = proto === 'ssh' || proto === 'serial' ? `${icon.play} Connect` : `${icon.folder} Open`;
+    };
+    let scanned = false;
+    // Fill the port suggestions with what's plugged in right now.
+    scanPorts = async () => {
+      const hint = form.querySelector('.ports-hint');
+      try {
+        const ports = await api.serialPorts();
+        form.querySelector('#serial-ports').innerHTML = ports.map((p) => `<option value="${esc(p.name)}">${esc(p.description)}</option>`).join('');
+        hint.textContent = ports.length
+          ? `Found: ${ports.map((p) => p.name.replace(/^\/dev\//, '') + (p.description ? ` (${p.description})` : '')).join(', ')}`
+          : 'No serial devices found. Plug one in and press Scan.';
+        const input = form.elements.serialPort;
+        if (!input.value && ports.length === 1) input.value = ports[0].name;
+      } catch (e) {
+        hint.textContent = String(e);
+      }
+    };
+    form.addEventListener('change', (e) => { if (e.target.name === 'protocol') sync(); });
+    sync();
   }
 
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
@@ -917,6 +1505,34 @@ function wireDrawer(kind, id) {
     if (!act) return;
     if (act === 'close') closeDrawer();
     else if (act === 'save-connect') save(true);
+    else if (act === 'scan-ports') scanPorts?.();
+    else if (act === 'api-add-field') {
+      const box = form.querySelector('.api-fields');
+      box.insertAdjacentHTML('beforeend', apiFieldHtml({ id: uid(), label: '', secret: true }, null, true));
+      box.lastElementChild.querySelector('[data-fl]').focus();
+    } else if (act === 'api-del-field') e.target.closest('.api-field').remove();
+    else if (act === 'api-show') {
+      const row = e.target.closest('.api-field');
+      const input = row.querySelector('[data-fv]');
+      if (input.type === 'password') {
+        if (!input.value && id && app.flags(id).fields?.includes(row.dataset.fid)) {
+          try { input.value = await api.revealApiSecret(id, row.dataset.fid); } catch (err) { return toast(String(err), 'error'); }
+        }
+        input.type = 'text';
+      } else input.type = 'password';
+    } else if (act === 'api-copy-field') {
+      const row = e.target.closest('.api-field');
+      copySecret(() => api.revealApiSecret(id, row.dataset.fid), row.querySelector('.api-field-label')?.textContent.trim() || 'Value');
+    } else if (act === 'api-clear') {
+      const row = e.target.closest('.api-field');
+      row.dataset.clear = '1';
+      const input = row.querySelector('[data-fv]');
+      input.value = '';
+      input.placeholder = 'Will be forgotten when you save';
+    } else if (act === 'api-copy-as') {
+      const r = e.target.closest('button').getBoundingClientRect();
+      apiCopyMenu(r.left, r.top - 8, id, true);
+    }
     else if (act === 'copy-pub') copyPub(id);
     else if (act === 'delete') {
       if (kind === 'host') deleteHost(id);
@@ -928,6 +1544,22 @@ function wireDrawer(kind, id) {
         }
       } else if (kind === 'snippet') {
         if (await run(() => api.deleteSnippet(id))) closeDrawer();
+      } else if (kind === 'apigroup') {
+        const g = app.apiGroup(id);
+        const n = app.data().apiKeys.filter((a) => a.groupId === id).length;
+        if (await confirmDialog('Delete group?', `<strong>${esc(g?.name)}</strong> will be removed.${n ? ` Its ${n} credential${n === 1 ? '' : 's'} will be kept and moved out of the group.` : ''}`)) {
+          if (await run(() => api.deleteApiGroup(id))) { closeDrawer(); app.apiGroupId = 'all'; renderContent(); }
+        }
+      } else if (kind === 'apikey') {
+        if (await confirmDialog('Delete credential?', `<strong>${esc(app.apiKey(id)?.name)}</strong> and its saved secrets will be removed from this computer.`)) {
+          if (await run(() => api.deleteApiKey(id))) closeDrawer();
+        }
+      } else if (kind === 'pwgroup') {
+        const g = app.pwGroup(id);
+        const n = app.data().passwords.filter((p) => p.groupId === id).length;
+        if (await confirmDialog('Delete group?', `<strong>${esc(g?.name)}</strong> will be removed.${n ? ` Its ${n} password${n === 1 ? '' : 's'} will be kept and moved out of the group.` : ''}`)) {
+          if (await run(() => api.deletePasswordGroup(id))) { closeDrawer(); app.pwGroupId = 'all'; renderContent(); }
+        }
       } else if (kind === 'password') {
         if (await confirmDialog('Delete password?', `<strong>${esc(app.password(id)?.name)}</strong> will be removed from this computer.`)) {
           if (await run(() => api.deletePassword(id))) closeDrawer();
@@ -972,6 +1604,19 @@ function wireDrawer(kind, id) {
   });
 }
 
+// ---------- theme ----------
+const darkQuery = matchMedia('(prefers-color-scheme: dark)');
+
+function applyTheme(setting = app.settings().theme || 'system') {
+  const resolved = setting === 'system' ? (darkQuery.matches ? 'dark' : 'light') : setting;
+  document.documentElement.dataset.theme = resolved;
+  try { localStorage.setItem('nimbus-theme', resolved); } catch { /* storage unavailable */ }
+  // The native window chrome (macOS title bar buttons, Windows frame) follows too.
+  try { getCurrentWindow().setTheme(setting === 'system' ? null : setting).catch(() => {}); } catch { /* browser preview */ }
+  app.sessions.forEach((x) => x.applySettings(app.settings()));
+}
+darkQuery.addEventListener('change', () => { if ((app.snap?.data.settings.theme || 'system') === 'system') applyTheme(); });
+
 // ---------- shortcuts ----------
 function shortcutFor(e) {
   const mod = isMac ? e.metaKey && !e.ctrlKey && !e.altKey : e.ctrlKey && e.shiftKey && !e.altKey;
@@ -981,6 +1626,7 @@ function shortcutFor(e) {
   if (e.code === 'KeyW') return 'close-tab';
   if (e.code === 'KeyD') return 'duplicate-tab';
   if (e.code === 'KeyP' && e.shiftKey) return 'type-password';
+  if (e.code === 'KeyO' && e.shiftKey) return 'open-sftp';
   if (/^Digit[1-9]$/.test(e.code)) return `tab-${e.code.slice(5)}`;
   if (isMac && (e.key === '}' || e.key === '{')) return e.key === '}' ? 'next-tab' : 'prev-tab';
   return null;
@@ -999,9 +1645,12 @@ function doShortcut(name) {
   } else if (name === 'close-tab') {
     if (app.active) app.closeSession(app.active);
   } else if (name === 'type-password') {
-    app.active?.quickTypePassword();
+    app.active?.quickTypePassword?.();
+  } else if (name === 'open-sftp') {
+    const h = app.active && app.host(app.active.hostId);
+    if (h && app.active.kind === 'term') app.openFiles(h.id);
   } else if (name === 'duplicate-tab') {
-    if (app.active) app.connect(app.active.hostId);
+    if (app.active) app.duplicate(app.active);
   } else if (name === 'next-tab') app.activate(list[(i + 1) % list.length]);
   else if (name === 'prev-tab') app.activate(list[(i - 1 + list.length) % list.length]);
   else if (name.startsWith('tab-')) {
@@ -1027,6 +1676,16 @@ window.addEventListener(
 // macOS menu accelerators (⌘T, ⌘W, …) arrive from the native menu instead of as key events.
 listen('menu', (e) => { if (!modalOpen()) doShortcut(e.payload); });
 
+// Any web link opens in the default browser, never inside Nimbus (the Rust side also blocks
+// in-app navigation as a backstop).
+document.addEventListener('click', (e) => {
+  const link = e.target.closest('a[href]');
+  if (!link || e.defaultPrevented) return;
+  e.preventDefault();
+  const href = link.getAttribute('href');
+  if (/^(https?|mailto):/i.test(href)) openUrl(href).catch((err) => toast(String(err), 'error'));
+});
+
 // Don't let the webview's own context menu appear outside text fields.
 document.addEventListener('contextmenu', (e) => {
   if (!e.target.closest('input, textarea, .selectable, .xterm')) e.preventDefault();
@@ -1036,7 +1695,9 @@ document.addEventListener('contextmenu', (e) => {
 (async () => {
   try {
     setSnap(await api.state());
+    applyTheme();
     renderTabs();
+    listenForFileDrops(app);
   } catch (e) {
     document.body.innerHTML = `<div class="empty"><h2>Nimbus couldn't start</h2><p class="selectable">${esc(String(e))}</p></div>`;
   }

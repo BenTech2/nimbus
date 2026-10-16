@@ -26,6 +26,8 @@ use crate::store::{now_ms, KnownHost, Host, Store};
 pub enum Input {
     Data(Vec<u8>),
     Resize(u32, u32),
+    /// Serial only: hold the line in the break state briefly (e.g. to reach a router's ROMMON).
+    Break,
     Close,
 }
 
@@ -55,12 +57,12 @@ pub struct Ctx {
 }
 
 impl Ctx {
-    fn status(&self, state: &str, message: impl Into<String>) {
+    pub(crate) fn status(&self, state: &str, message: impl Into<String>) {
         let _ = self.events.send(json!({ "type": "status", "state": state, "message": message.into() }));
     }
 
     /// Ask the UI something and wait. `None` means the user cancelled.
-    async fn ask(&self, kind: &str, data: Value) -> Option<Value> {
+    pub(crate) async fn ask(&self, kind: &str, data: Value) -> Option<Value> {
         let id = crate::store::new_id();
         let (tx, rx) = oneshot::channel();
         self.prompts.pending.lock().unwrap().insert(id.clone(), tx);
@@ -71,7 +73,7 @@ impl Ctx {
     }
 
     /// Ask for a secret; returns (value, save).
-    async fn ask_secret(&self, kind: &str, title: &str, message: String, allow_save: bool) -> Option<(String, bool)> {
+    pub(crate) async fn ask_secret(&self, kind: &str, title: &str, message: String, allow_save: bool) -> Option<(String, bool)> {
         let v = self
             .ask(kind, json!({ "title": title, "message": message, "allowSave": allow_save }))
             .await?;
@@ -80,7 +82,7 @@ impl Ctx {
         Some((value, save))
     }
 
-    fn save_store(&self, f: impl FnOnce(&mut Store)) {
+    pub(crate) fn save_store(&self, f: impl FnOnce(&mut Store)) {
         let mut s = self.store.lock().unwrap();
         f(&mut s);
         if let Err(e) = s.save() {
@@ -89,7 +91,7 @@ impl Ctx {
     }
 }
 
-struct Client {
+pub struct Client {
     ctx: Ctx,
     target: String,
     rejected: Arc<AtomicBool>,
@@ -138,11 +140,11 @@ impl client::Handler for Client {
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-fn display_name(h: &Host) -> String {
+pub(crate) fn display_name(h: &Host) -> String {
     if h.label.trim().is_empty() { h.address.clone() } else { h.label.clone() }
 }
 
-fn connect_host<'a>(
+pub(crate) fn connect_host<'a>(
     ctx: &'a Ctx,
     host: Host,
     depth: u8,
@@ -518,6 +520,7 @@ async fn session_inner(
             input = rx.recv() => match input {
                 Some(Input::Data(bytes)) => channel.data(&bytes[..]).await?,
                 Some(Input::Resize(c, r)) => { let _ = channel.window_change(c, r, 0, 0).await; }
+                Some(Input::Break) => {}
                 Some(Input::Close) | None => { let _ = channel.close().await; break; }
             },
         }

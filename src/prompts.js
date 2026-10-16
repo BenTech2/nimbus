@@ -1,4 +1,4 @@
-// Dialogs the SSH backend asks for while connecting.
+// Dialogs the backend asks for while connecting (SSH, SFTP, FTP), plus a simple text prompt.
 import { esc, modal } from './ui.js';
 
 export async function hostKeyPrompt(d, ctl) {
@@ -11,7 +11,7 @@ export async function hostKeyPrompt(d, ctl) {
          <div class="k">Previously trusted</div><div>${esc(d.previous)}</div>
          <div class="k">Now presenting (${esc(d.keyType)})</div><div>${esc(d.fingerprint)}</div></div>`
     : `<p>This is the first time Nimbus has connected to <strong>${esc(d.host)}</strong>. Check the fingerprint
-         matches the server before trusting it.</p>
+         matches the server before trusting it.</p>${d.note ? `<p class="hint">${esc(d.note)}</p>` : ''}
        <div class="fp-box"><div class="k">${esc(d.keyType)}</div><div class="selectable">${esc(d.fingerprint)}</div></div>`;
   const r = await modal({
     title: changed ? 'Host key changed' : 'Trust this host?',
@@ -40,8 +40,14 @@ export async function secretPrompt(kind, d, ctl) {
 export async function textPrompt(d, ctl) {
   const r = await modal({
     title: d.title || 'Input',
-    html: `<p>${esc(d.message)}</p><label class="field"><input type="text" name="value" autofocus spellcheck="false"></label>`,
+    html: `<p>${esc(d.message)}</p><label class="field"><input type="text" name="value" value="${esc(d.value ?? '')}" autofocus spellcheck="false"></label>`,
     ctl,
+    init: (form) => {
+      // Pre-select the part of a file name before its extension, like Finder and Explorer.
+      const input = form.elements.value;
+      const dot = d.selectStem ? input.value.lastIndexOf('.') : -1;
+      requestAnimationFrame(() => input.setSelectionRange(0, dot > 0 ? dot : input.value.length));
+    },
     buttons: [{ label: 'Cancel', value: 'cancel' }, { label: 'Continue', value: 'ok', kind: 'primary', submit: true }],
   });
   return r.action === 'ok' ? { value: r.values.value } : null;

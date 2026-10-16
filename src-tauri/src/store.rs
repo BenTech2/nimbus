@@ -5,7 +5,7 @@
 //!   secrets.bin       — passwords, private keys and passphrases, AES-256-GCM encrypted with a
 //!                       master key held in the OS keychain (see `vault.rs`)
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,8 +30,9 @@ pub struct Group {
 pub struct Host {
     pub id: String,
     pub label: String,
-    /// "ssh" today; "rdp" is reserved so RDP hosts can share the same list later.
+    /// "ssh", "serial", "ftp" or "ftps" (FTP with explicit TLS). "rdp" is reserved for later.
     pub protocol: String,
+    /// For SSH/FTP the host name or IP; for serial the port (e.g. /dev/cu.usbserial-10, COM3).
     pub address: String,
     pub port: Option<u16>,
     pub username: Option<String>,
@@ -43,6 +44,28 @@ pub struct Host {
     pub tags: Vec<String>,
     pub notes: Option<String>,
     pub last_connected: Option<i64>,
+    // Serial only. Unset means 9600 baud, 8 data bits, no parity, 1 stop bit, no flow control.
+    pub baud_rate: Option<u32>,
+    pub data_bits: Option<u8>,
+    /// "none", "odd" or "even".
+    pub parity: Option<String>,
+    pub stop_bits: Option<u8>,
+    /// "none", "software" (XON/XOFF) or "hardware" (RTS/CTS).
+    pub flow_control: Option<String>,
+    /// What Enter sends: "cr" (default), "lf" or "crlf".
+    pub newline: Option<String>,
+    /// Show typed characters locally, for devices that don't echo.
+    pub local_echo: bool,
+}
+
+impl Host {
+    pub fn is_ssh(&self) -> bool {
+        !matches!(self.protocol.as_str(), "ftp" | "ftps" | "serial")
+    }
+
+    pub fn is_serial(&self) -> bool {
+        self.protocol == "serial"
+    }
 }
 
 impl Default for Host {
@@ -62,6 +85,13 @@ impl Default for Host {
             tags: vec![],
             notes: None,
             last_connected: None,
+            baud_rate: None,
+            data_bits: None,
+            parity: None,
+            stop_bits: None,
+            flow_control: None,
+            newline: None,
+            local_echo: false,
         }
     }
 }
@@ -93,8 +123,52 @@ pub struct Snippet {
 pub struct PasswordEntry {
     pub id: String,
     pub name: String,
+    pub group_id: Option<String>,
     pub username: Option<String>,
     pub url: Option<String>,
+    pub notes: Option<String>,
+    pub updated: i64,
+}
+
+/// A folder in the password manager. Separate from host groups, which carry login defaults.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PasswordGroup {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+}
+
+/// One field of an API credential: "API key", "Client ID", "Token URL", a custom header…
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ApiField {
+    /// Stable within its credential: "key", "token", "clientSecret"… or generated for custom fields.
+    pub id: String,
+    pub label: String,
+    /// Secret values live in the encrypted secrets under the credential's id, never here.
+    pub secret: bool,
+    /// The value of a non-secret field.
+    pub value: Option<String>,
+}
+
+/// A stored API credential (the "API Keys" view).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ApiCredential {
+    pub id: String,
+    pub name: String,
+    pub group_id: Option<String>,
+    /// "apiKey", "bearer", "basic", "oauth2" or "custom". Decides which fields the UI shows.
+    pub kind: String,
+    /// Who issued it, e.g. "GitHub", "Stripe".
+    pub service: Option<String>,
+    /// e.g. "Production", "Staging", "Development".
+    pub environment: Option<String>,
+    pub base_url: Option<String>,
+    pub fields: Vec<ApiField>,
+    /// When the key or token stops working (ms since the epoch).
+    pub expires: Option<i64>,
     pub notes: Option<String>,
     pub updated: i64,
 }
@@ -112,6 +186,10 @@ pub struct KnownHost {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    /// "system", "dark" or "light".
+    pub theme: String,
+    /// How the Hosts screen lays out hosts: "grid" or "list".
+    pub hosts_view: String,
     pub font_size: u16,
     pub font_family: String,
     pub cursor_style: String,
@@ -128,6 +206,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
+            theme: "system".into(),
+            hosts_view: "grid".into(),
             font_size: 13,
             font_family: "\"SF Mono\", \"Cascadia Mono\", Menlo, Consolas, \"DejaVu Sans Mono\", monospace".into(),
             cursor_style: "block".into(),
@@ -150,6 +230,10 @@ pub struct Data {
     pub keys: Vec<Key>,
     pub snippets: Vec<Snippet>,
     pub passwords: Vec<PasswordEntry>,
+    pub password_groups: Vec<PasswordGroup>,
+    pub api_keys: Vec<ApiCredential>,
+    /// Folders in the API Keys view (same shape as password groups).
+    pub api_groups: Vec<PasswordGroup>,
     pub known_hosts: Vec<KnownHost>,
     pub settings: Settings,
 }
@@ -161,11 +245,14 @@ pub struct Secret {
     pub password: Option<String>,
     pub private_key: Option<String>,
     pub passphrase: Option<String>,
+    /// An API credential's secret field values, by field id.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, String>,
 }
 
 impl Secret {
     pub fn is_empty(&self) -> bool {
-        self.password.is_none() && self.private_key.is_none() && self.passphrase.is_none()
+        self.password.is_none() && self.private_key.is_none() && self.passphrase.is_none() && self.fields.is_empty()
     }
 }
 
@@ -176,6 +263,8 @@ pub struct SecretFlags {
     pub password: bool,
     pub private_key: bool,
     pub passphrase: bool,
+    /// Ids of an API credential's secret fields that have a value.
+    pub fields: Vec<String>,
 }
 
 pub struct Store {
@@ -277,6 +366,7 @@ impl Store {
                         password: s.password.is_some(),
                         private_key: s.private_key.is_some(),
                         passphrase: s.passphrase.is_some(),
+                        fields: s.fields.keys().cloned().collect(),
                     },
                 )
             })
@@ -310,17 +400,20 @@ impl Store {
     }
 
     /// A host with its group's defaults filled in where the host leaves a field blank.
+    /// A group's port and key are SSH settings, so FTP hosts only inherit the username.
     pub fn effective_host(&self, id: &str) -> Option<Host> {
         let mut h = self.host(id)?.clone();
         if let Some(g) = h.group_id.as_deref().and_then(|g| self.group(g)) {
             if h.username.as_deref().unwrap_or("").is_empty() {
                 h.username = g.username.clone();
             }
-            if h.port.is_none() {
-                h.port = g.port;
-            }
-            if h.key_id.is_none() {
-                h.key_id = g.key_id.clone();
+            if h.is_ssh() {
+                if h.port.is_none() {
+                    h.port = g.port;
+                }
+                if h.key_id.is_none() {
+                    h.key_id = g.key_id.clone();
+                }
             }
         }
         Some(h)

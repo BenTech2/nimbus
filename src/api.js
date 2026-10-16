@@ -20,11 +20,32 @@ export const api = {
   typePassword: (sessionId, secretId) => invoke('ssh_type_password', { sessionId, secretId }),
   deleteKnownHost: (host) => invoke('delete_known_host', { host }),
   saveSettings: (settings) => invoke('save_settings', { settings }),
-  exportData: (path, passphrase) => invoke('export_data', { path, passphrase }),
-  importPreview: (path) => invoke('import_preview', { path }),
-  importApply: (path, mode, passphrase) => invoke('import_apply', { path, mode, passphrase }),
+  exportData: (path, password) => invoke('export_data', { path, password }),
+  importPreview: (path, password) => invoke('import_preview', { path, password }),
+  importApply: (path, mode, password) => invoke('import_apply', { path, mode, password }),
   importSshConfig: () => invoke('import_ssh_config'),
   promptReply: (id, value) => invoke('prompt_reply', { id, value }),
+  savePasswordGroup: (group) => invoke('save_password_group', { group }),
+  saveApiKey: (entry, secrets) => invoke('save_api_key', { entry, secrets }),
+  deleteApiKey: (id) => invoke('delete_api_key', { id }),
+  revealApiSecret: (id, fieldId) => invoke('reveal_api_secret', { id, fieldId }),
+  saveApiGroup: (group) => invoke('save_api_group', { group }),
+  deleteApiGroup: (id) => invoke('delete_api_group', { id }),
+  deletePasswordGroup: (id) => invoke('delete_password_group', { id }),
+
+  // Files tab. sessionId "local" is this computer.
+  fsOpen(sessionId, hostId, onEvent) {
+    const events = new Channel();
+    events.onmessage = onEvent;
+    return invoke('fs_open', { sessionId, hostId, events });
+  },
+  fsClose: (sessionId) => invoke('fs_close', { sessionId }),
+  fsList: (sessionId, path) => invoke('fs_list', { sessionId, path }),
+  fsMkdir: (sessionId, dir, name) => invoke('fs_mkdir', { sessionId, dir, name }),
+  fsRename: (sessionId, dir, from, to) => invoke('fs_rename', { sessionId, dir, from, to }),
+  fsDelete: (sessionId, items) => invoke('fs_delete', { sessionId, items }),
+  fsTransfer: (sessionId, transferId, upload, items, dest) => invoke('fs_transfer', { sessionId, transferId, upload, items, dest }),
+  fsCancel: (sessionId, transferId) => invoke('fs_cancel', { sessionId, transferId }),
 
   connect(sessionId, hostId, cols, rows, onEvent, onData) {
     const events = new Channel();
@@ -35,5 +56,7 @@ export const api = {
   },
   write: (sessionId, data) => invoke('ssh_write', { sessionId, data }),
   resize: (sessionId, cols, rows) => invoke('ssh_resize', { sessionId, cols, rows }),
+  sendBreak: (sessionId) => invoke('ssh_break', { sessionId }),
+  serialPorts: () => invoke('serial_ports'),
   close: (sessionId) => invoke('ssh_close', { sessionId }),
 };

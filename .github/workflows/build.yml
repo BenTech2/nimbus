@@ -29,6 +29,10 @@ jobs:
           - os: ubuntu-22.04
             args: ''
             rust_targets: ''
+          # 64-bit ARM Linux (Steam Frame, Raspberry Pi 5, Snapdragon laptops), built natively.
+          - os: ubuntu-22.04-arm
+            args: ''
+            rust_targets: ''
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +41,7 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libudev-dev
 
       - uses: actions/setup-node@v4
         with:

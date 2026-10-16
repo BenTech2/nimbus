@@ -8,12 +8,23 @@ import { api } from './api.js';
 import { esc, icon, uid, toast } from './ui.js';
 import { hostKeyPrompt, kbdPrompt, secretPrompt, textPrompt } from './prompts.js';
 
-const THEME = {
-  background: '#10121a', foreground: '#e7e9f1', cursor: '#4f8cff', cursorAccent: '#10121a',
-  selectionBackground: 'rgba(79, 140, 255, 0.35)',
-  black: '#1d2030', red: '#f2555a', green: '#34c77b', yellow: '#f5b041', blue: '#4f8cff', magenta: '#b07bff', cyan: '#2fc6d6', white: '#c9cde0',
-  brightBlack: '#5d6380', brightRed: '#ff7b7f', brightGreen: '#5be39a', brightYellow: '#ffd27a', brightBlue: '#7fb0ff', brightMagenta: '#cda4ff', brightCyan: '#6be3ef', brightWhite: '#ffffff',
+const THEMES = {
+  dark: {
+    background: '#10121a', foreground: '#e7e9f1', cursor: '#4f8cff', cursorAccent: '#10121a',
+    selectionBackground: 'rgba(79, 140, 255, 0.35)',
+    black: '#1d2030', red: '#f2555a', green: '#34c77b', yellow: '#f5b041', blue: '#4f8cff', magenta: '#b07bff', cyan: '#2fc6d6', white: '#c9cde0',
+    brightBlack: '#5d6380', brightRed: '#ff7b7f', brightGreen: '#5be39a', brightYellow: '#ffd27a', brightBlue: '#7fb0ff', brightMagenta: '#cda4ff', brightCyan: '#6be3ef', brightWhite: '#ffffff',
+  },
+  // "White" and "bright white" are darkened so text a program prints in white stays readable.
+  light: {
+    background: '#ffffff', foreground: '#1f2333', cursor: '#2f6fec', cursorAccent: '#ffffff',
+    selectionBackground: 'rgba(47, 111, 236, 0.22)',
+    black: '#1f2333', red: '#cf2f36', green: '#17834b', yellow: '#9a6700', blue: '#2f6fec', magenta: '#8a3fd1', cyan: '#0b7f8c', white: '#6b7185',
+    brightBlack: '#8b91a5', brightRed: '#e5484d', brightGreen: '#1f9d5c', brightYellow: '#b47d00', brightBlue: '#4f8cff', brightMagenta: '#a35ee8', brightCyan: '#1597a8', brightWhite: '#3a4058',
+  },
 };
+
+export const termTheme = () => THEMES[document.documentElement.dataset.theme === 'light' ? 'light' : 'dark'];
 
 const isMac = navigator.userAgent.includes('Mac');
 
@@ -22,6 +33,8 @@ const toBytes = (d) => (d instanceof ArrayBuffer ? new Uint8Array(d) : Array.isA
 export class TermSession {
   constructor(app, host) {
     this.app = app;
+    this.kind = 'term';
+    this.serial = host.protocol === 'serial';
     this.id = uid();
     this.hostId = host.id;
     this.label = host.label || host.address;
@@ -37,6 +50,9 @@ export class TermSession {
     this.el.innerHTML = `
       <div class="term-host">
         <div class="term-tools">
+          ${this.serial
+            ? `<button class="btn small" data-act="break" title="Send a serial break (for example to reach a router's ROMMON)">${icon.zap} Break</button>`
+            : `<button class="btn small" data-act="sftp" title="Browse files on this server (${isMac ? '⌘⇧O' : 'Ctrl+Shift+O'})">${icon.folder} SFTP</button>`}
           <button class="btn small" data-act="passwords" title="Type a saved password (${isMac ? '⌘⇧P' : 'Ctrl+Shift+P'})">${icon.lock} Password</button>
           <button class="btn small" data-act="snippets">${icon.code} Snippets</button></div>
         <div class="term-status" hidden></div>
@@ -50,7 +66,9 @@ export class TermSession {
     const s = app.settings();
     this.term = new Terminal({
       fontFamily: s.fontFamily, fontSize: s.fontSize, cursorStyle: s.cursorStyle, cursorBlink: s.cursorBlink,
-      scrollback: s.scrollback, theme: THEME, macOptionIsMeta: true, allowProposedApi: true,
+      scrollback: s.scrollback, theme: termTheme(), macOptionIsMeta: true, allowProposedApi: true,
+      // Many serial devices end lines with a bare LF.
+      convertEol: this.serial,
     });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
@@ -184,6 +202,12 @@ export class TermSession {
     if (act === 'reconnect') this.connect();
     else if (act === 'close') this.app.closeSession(this);
     else if (act === 'edit') this.app.editHost(this.hostId);
+    else if (act === 'sftp') this.app.openFiles(this.hostId);
+    else if (act === 'break') {
+      if (this.state === 'connected') api.sendBreak(this.sid);
+      else toast('This session is not connected', 'error');
+      this.term.focus();
+    }
     else if (act === 'snippets' || act === 'passwords') this.togglePop(act);
     else if (act === 'set-host-pw') this.saveHostPassword();
     else if (e.target.closest('.snip-pop [data-snip]')) {
@@ -262,6 +286,7 @@ export class TermSession {
   applySettings(s) {
     Object.assign(this.term.options, {
       fontFamily: s.fontFamily, fontSize: s.fontSize, cursorStyle: s.cursorStyle, cursorBlink: s.cursorBlink, scrollback: s.scrollback,
+      theme: termTheme(),
     });
     this.fitNow();
   }

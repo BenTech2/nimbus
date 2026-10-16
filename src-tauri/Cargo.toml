@@ -1,6 +1,6 @@
 [package]
 name = "nimbus"
-version = "0.1.0"
+version = "0.4.0"
 description = "Nimbus - a simple, local-only SSH connection manager"
 edition = "2021"
 
@@ -25,12 +25,25 @@ dirs = "7.0.0"
 getrandom = "0.4.3"
 keyring = "4.2.0"
 russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa", "flate2"] }
+russh-sftp = "3.0.1"
+rustls-platform-verifier = "0.7.1"
 scrypt = "0.12.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+serialport = "4.10.1"
+sha2 = "0.10"
+suppaftp = { version = "12.2.1", features = ["tokio-rustls-ring"] }
 tauri = { version = "2.12.4", features = [] }
 tauri-plugin-clipboard-manager = "2.5.0"
 tauri-plugin-dialog = "2.8.3"
 tauri-plugin-opener = "2.7.2"
 tokio = { version = "1.53.3", features = ["full"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
+trash = "5.2.9"
 uuid = { version = "1.28.0", features = ["v4"] }
+
+[dev-dependencies]
+async-trait = "0.1.92"
+libunftp = { version = "0.23.1", default-features = false, features = ["ring"] }
+unftp-core = "0.1.0"
+unftp-sbe-fs = "0.4.0"
