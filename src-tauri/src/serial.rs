@@ -9,10 +9,10 @@ use std::time::Duration;
 use anyhow::{anyhow, bail};
 use serde::Serialize;
 use serialport::{DataBits, FlowControl, Parity, SerialPort, StopBits};
-use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::ipc::InvokeResponseBody;
 use tokio::sync::mpsc;
 
-use crate::ssh::{Ctx, Input};
+use crate::ssh::{Ctx, Input, Relay};
 use crate::store::{now_ms, Host};
 
 #[derive(Debug, Serialize)]
@@ -105,7 +105,7 @@ pub fn translate_enter(bytes: &[u8], newline: Option<&str>) -> Vec<u8> {
     out
 }
 
-pub async fn run_serial(ctx: Ctx, host_id: String, data: Channel<InvokeResponseBody>, mut rx: mpsc::UnboundedReceiver<Input>) {
+pub async fn run_serial(ctx: Ctx, host_id: String, data: Relay<InvokeResponseBody>, mut rx: mpsc::UnboundedReceiver<Input>) {
     match serial_inner(&ctx, &host_id, &data, &mut rx).await {
         Ok(msg) => ctx.status("closed", msg),
         Err(e) => ctx.status("error", format!("{e:#}")),
@@ -115,7 +115,7 @@ pub async fn run_serial(ctx: Ctx, host_id: String, data: Channel<InvokeResponseB
 async fn serial_inner(
     ctx: &Ctx,
     host_id: &str,
-    data: &Channel<InvokeResponseBody>,
+    data: &Relay<InvokeResponseBody>,
     rx: &mut mpsc::UnboundedReceiver<Input>,
 ) -> anyhow::Result<String> {
     let host = ctx.store.lock().unwrap().effective_host(host_id).ok_or_else(|| anyhow!("This host no longer exists"))?;

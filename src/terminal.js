@@ -2,6 +2,7 @@
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { writeText, readText } from '@tauri-apps/plugin-clipboard-manager';
 import { api } from './api.js';
@@ -72,6 +73,8 @@ export class TermSession {
     });
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
+    this.serializer = new SerializeAddon();
+    this.term.loadAddon(this.serializer);
     this.term.loadAddon(new WebLinksAddon((e, uri) => { if (e.metaKey || e.ctrlKey) openUrl(uri); }));
     this.term.open(this.hostEl);
     this.term.onData((d) => this.onInput(d));
@@ -93,12 +96,50 @@ export class TermSession {
     this.setState('connecting', 'Starting…');
     this.fitNow();
     api
-      .connect(
-        sid, this.hostId, this.term.cols, this.term.rows,
-        (ev) => { if (sid === this.sid) this.onEvent(ev); },
-        (data) => { if (sid === this.sid) this.term.write(toBytes(data)); },
-      )
+      .connect(sid, this.hostId, this.term.cols, this.term.rows, ...this.handlers(sid))
       .catch((e) => this.setState('error', String(e)));
+  }
+
+  /** Event and output handlers for backend session `sid` (ignored once the tab moves on). */
+  handlers(sid) {
+    return [
+      (ev) => { if (sid === this.sid) this.onEvent(ev); },
+      (data) => { if (sid === this.sid) this.term.write(toBytes(data)); },
+    ];
+  }
+
+  // ---------- moving to another window ----------
+  /** Why this tab can't move right now, or null. */
+  cantMove() {
+    return this.promptCtl ? 'Answer the login prompt first' : null;
+  }
+
+  /** What another window needs to carry on: the session, its state and the scrollback. */
+  handoffPayload() {
+    return {
+      kind: 'term', hostId: this.hostId, label: this.label, sid: this.sid, state: this.state, message: this.message,
+      everConnected: this.everConnected, buffer: this.serializer.serialize({ scrollback: this.app.settings().scrollback }),
+    };
+  }
+
+  /** Pick up a tab handed over from another window. */
+  async adoptFrom(p) {
+    this.sid = p.sid;
+    this.everConnected = p.everConnected;
+    await new Promise((r) => this.term.write(p.buffer, r));
+    this.setState(p.state, p.message);
+    await api.tabAttach(p.sid, ...this.handlers(p.sid));
+    this.fitNow();
+    if (this.state === 'connected') api.resize(this.sid, this.term.cols, this.term.rows);
+  }
+
+  /** The tab has moved to another window: drop this view but keep the connection. */
+  release() {
+    this.promptCtl?.cancel?.();
+    this.sid = null;
+    this.ro.disconnect();
+    this.term.dispose();
+    this.el.remove();
   }
 
   onEvent(ev) {

@@ -4,11 +4,13 @@ import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialo
 import { readText, writeText } from '@tauri-apps/plugin-clipboard-manager';
 import { listen } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
+import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import { openUrl } from '@tauri-apps/plugin-opener';
 import { api } from './api.js';
 import { COLORS, confirmDialog, contextMenu, esc, icon, initials, modal, modalOpen, timeAgo, toast, uid } from './ui.js';
 import { TermSession } from './terminal.js';
 import { FileSession, listenForFileDrops, protocolLabel } from './files.js';
+import logoUrl from './assets/logo.svg';
 import { API_KINDS, ENVIRONMENTS, buildCopy, copyFormats, envColor, expiryInfo, identity, primaryField } from './apikeys.js';
 
 // Opened in a plain browser during development: fake the backend so the UI still works.
@@ -20,12 +22,20 @@ if (isMac) document.body.classList.add('mac');
 try { document.documentElement.dataset.theme = localStorage.getItem('nimbus-theme') || 'dark'; } catch { /* storage unavailable */ }
 const MOD = isMac ? '⌘' : 'Ctrl+Shift+';
 
+// "main" has the sidebar and the Nimbus tab; a tab dragged out gets a window of its own ("tab-…").
+const thisWindow = (() => { try { return getCurrentWebviewWindow(); } catch { return null; } })();
+const windowLabel = thisWindow?.label || 'main';
+const isTabWindow = windowLabel !== 'main';
+if (isTabWindow) document.body.classList.add('tab-window');
+/** Window-scoped events: only what's meant for this window (and app-wide broadcasts). */
+const onEvent = (name, fn) => (thisWindow ? thisWindow.listen(name, fn) : listen(name, fn));
+
 const $ = (sel, root = document) => root.querySelector(sel);
 
 const app = {
   snap: null,
   view: 'hosts', // hosts | passwords | keys | snippets | known | transfer | settings
-  groupId: null,
+  hostGroupId: 'all', // Hosts view filter: 'all', 'none' or a group id
   search: '',
   drawer: null, // { kind, id }
   pwGroupId: 'all', // Passwords view filter: 'all', 'none' or a password group id
@@ -72,6 +82,8 @@ const app = {
     else this.connect(s.hostId);
   },
   activate(s) {
+    // A tab window has no home screen: show another tab instead.
+    if (!s && isTabWindow) s = this.sessions[0] || null;
     if (this.active !== s) {
       this.active?.hide();
       this.active = s;
@@ -89,6 +101,46 @@ const app = {
     if (this.active === s) this.activate(this.sessions[i] || this.sessions[i - 1] || null);
     s.dispose();
     renderTabs();
+    if (isTabWindow && !this.sessions.length) api.closeTabWindow();
+  },
+
+  /** Show a tab handed over from another window. */
+  async adoptTab(sid, index = this.sessions.length) {
+    try {
+      const p = await api.tabClaim(sid);
+      const host = this.host(p.hostId) || { id: p.hostId, label: p.label, address: '', protocol: p.kind === 'files' ? 'ftp' : 'ssh' };
+      const s = p.kind === 'files' ? new FileSession(this, host, { adopting: true }) : new TermSession(this, host);
+      this.sessions.splice(Math.min(index, this.sessions.length), 0, s);
+      this.activate(s);
+      await s.adoptFrom(p);
+      renderTabs();
+      thisWindow?.setFocus().catch(() => {});
+    } catch (e) {
+      toast(String(e), 'error');
+      if (isTabWindow && !this.sessions.length) api.closeTabWindow();
+    }
+  },
+
+  /** Hand a tab to another window (`target`), or to a new one at `frame` [x, y, w, h]. */
+  async releaseTab(s, target, frame = [0, 0, 0, 0]) {
+    const why = s.cantMove();
+    if (why) { toast(why, 'error'); return null; }
+    const sid = s.sid;
+    if (!sid) { toast('Reconnect this tab before moving it', 'error'); return null; }
+    let label;
+    try {
+      label = await api.tabHandoff(sid, s.handoffPayload(), target, ...frame);
+    } catch (e) {
+      toast(String(e), 'error');
+      return null;
+    }
+    const i = this.sessions.indexOf(s);
+    this.sessions.splice(i, 1);
+    if (this.active === s) this.activate(this.sessions[i] || this.sessions[i - 1] || null);
+    s.release();
+    renderTabs();
+    if (isTabWindow && !this.sessions.length) api.closeTabWindow();
+    return label;
   },
   sessionChanged() { renderTabs(); },
   editHost(id) {
@@ -165,13 +217,13 @@ function hostSubtitle(h) {
 function renderTabs() {
   const tabs = $('#tabs');
   tabs.innerHTML =
-    `<button class="tab home ${app.active ? '' : 'active'}" data-tab="home">${icon.server}<span class="label">Hosts</span></button>` +
+    (isTabWindow ? '' : `<button class="tab home ${app.active ? '' : 'active'}" data-tab="home" title="Nimbus"><img class="app-logo" src="${logoUrl}" alt=""><span class="label">Nimbus</span></button>`) +
     app.sessions
       .map((s, i) => {
         const h = app.host(s.hostId);
         const label = h ? h.label || h.address : s.label;
         const kind = s.kind === 'files' ? `<span class="kind">${protocolLabel(h)}</span>` : '';
-        return `<button class="tab ${app.active === s ? 'active' : ''}" data-tab="${i}" title="${esc(label)}">
+        return `<button class="tab ${app.active === s ? 'active' : ''} ${tabDrag.s === s ? 'drag-src' : ''}" data-tab="${i}" title="${esc(label)}">
           <span class="dot ${s.state}"></span><span class="label">${esc(label)}</span>${kind}
           <span class="close" data-close="${i}" role="button" aria-label="Close tab">${icon.x}</span></button>`;
       })
@@ -187,6 +239,7 @@ $('#tabs').addEventListener('mousedown', (e) => {
   }
 });
 $('#tabs').addEventListener('click', (e) => {
+  if (tabDrag.justDragged) return;
   const close = e.target.closest('[data-close]');
   if (close) return app.closeSession(app.sessions[+close.dataset.close]);
   const tab = e.target.closest('.tab');
@@ -210,6 +263,122 @@ $('#tabs').addEventListener('contextmenu', (e) => {
   ]);
 });
 
+// ---------- dragging tabs: reorder, pull out into a window, drop onto another window ----------
+const tabDrag = { s: null };
+// Where the pointer sits in a new window: over its first tab.
+const GRAB = { x: isMac ? 150 : 70, y: 19 };
+
+$('#tabs').addEventListener('pointerdown', (e) => {
+  const tab = e.target.closest('.tab');
+  if (e.button !== 0 || !tab || tab.dataset.tab === 'home' || e.target.closest('[data-close]')) return;
+  const s = app.sessions[+tab.dataset.tab];
+  Object.assign(tabDrag, { s, sid: s.sid, pointerId: e.pointerId, lost: false, x0: e.clientX, y0: e.clientY, sx0: e.screenX, sy0: e.screenY, wx0: window.screenX, wy0: window.screenY, mode: null, label: null, over: null, last: null });
+});
+
+$('#tabs').addEventListener('pointermove', (e) => {
+  const d = tabDrag;
+  if (!d.s) return;
+  d.last = { x: e.screenX, y: e.screenY };
+  if (!d.mode) {
+    if (Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 6) return;
+    // Only now keep the pointer, so a plain click still reaches the tab.
+    $('#tabs').setPointerCapture(d.pointerId);
+    // The only tab of a tab window: drag the whole window, like Chrome.
+    d.mode = isTabWindow && app.sessions.length === 1 ? 'window' : 'strip';
+    if (d.mode === 'window') d.label = windowLabel;
+    document.body.classList.add('tab-dragging');
+    renderTabs();
+  }
+  if (d.mode === 'strip') {
+    const bar = $('#titlebar').getBoundingClientRect();
+    const out = e.clientY > bar.bottom + 30 || e.clientY < bar.top - 30 || e.clientX < -10 || e.clientX > innerWidth + 10;
+    if (out) return tearOut(e);
+    // Reorder: move the tab past the middle of its neighbour.
+    const tabs = [...$('#tabs').querySelectorAll('.tab:not(.home)')];
+    const from = app.sessions.indexOf(d.s);
+    const to = tabs.findIndex((t) => { const r = t.getBoundingClientRect(); return e.clientX >= r.left && e.clientX <= r.right; });
+    if (to >= 0 && to !== from) {
+      const r = tabs[to].getBoundingClientRect();
+      const pastMiddle = to > from ? e.clientX > r.left + r.width / 2 : e.clientX < r.left + r.width / 2;
+      if (pastMiddle) {
+        app.sessions.splice(from, 1);
+        app.sessions.splice(to, 0, d.s);
+        renderTabs();
+      }
+    }
+  } else if (d.mode === 'window' && d.label) {
+    followPointer(e);
+  }
+});
+
+/** Pull the dragged tab out into a new window that then follows the pointer. */
+async function tearOut(e) {
+  const d = tabDrag;
+  d.mode = 'pending';
+  const s = d.s;
+  const label = await app.releaseTab(s, null, [e.screenX - GRAB.x, e.screenY - GRAB.y, innerWidth, innerHeight]);
+  if (tabDrag.s !== s) return; // the drag already ended
+  if (!label) { endTabDrag(); return; }
+  if (d.lost) { Object.assign(d, { mode: 'window', label }); return finishTabDrag(null); }
+  Object.assign(d, { mode: 'window', label, sx0: e.screenX, sy0: e.screenY, wx0: e.screenX - GRAB.x, wy0: e.screenY - GRAB.y });
+  if (d.last) followPointer({ screenX: d.last.x, screenY: d.last.y });
+}
+
+let followQueued = null;
+function followPointer(e) {
+  const d = tabDrag;
+  // At most one move per frame, and an occasional check for a tab bar to drop onto.
+  const run = !followQueued;
+  followQueued = { x: e.screenX, y: e.screenY };
+  if (!run) return;
+  requestAnimationFrame(() => {
+    const p = followQueued;
+    followQueued = null;
+    if (!d.label || !p) return;
+    api.tabWindowMove(d.label, d.wx0 + (p.x - d.sx0), d.wy0 + (p.y - d.sy0));
+    const now = performance.now();
+    if (!d.hoverAt || now - d.hoverAt > 90) {
+      d.hoverAt = now;
+      api.tabDragOver([d.label], p.x, p.y, false).then((t) => { d.over = t; }).catch(() => {});
+    }
+  });
+}
+
+async function finishTabDrag(e) {
+  const d = tabDrag;
+  if (!d.s) return;
+  const { mode, label, sid } = d;
+  const at = e && e.screenX != null ? { x: e.screenX, y: e.screenY } : d.last;
+  endTabDrag();
+  if (mode) {
+    // Swallow the click that ends a drag (if the browser sends one), but not the next real one.
+    tabDrag.justDragged = true;
+    setTimeout(() => { tabDrag.justDragged = false; }, 0);
+  }
+  if (mode === 'window' && label && at) {
+    // Dropped onto another window's tab bar: the tab joins that window.
+    const target = await api.tabDragOver([label], at.x, at.y, true).catch(() => null);
+    if (target) await api.tabMove(sid, target).catch((err) => toast(String(err), 'error'));
+    else api.focusWindow(label);
+  }
+}
+
+function endTabDrag() {
+  const dragged = !!tabDrag.mode;
+  tabDrag.s = null;
+  tabDrag.mode = null;
+  document.body.classList.remove('tab-dragging');
+  if (dragged) renderTabs();
+}
+
+$('#tabs').addEventListener('pointerup', (e) => finishTabDrag(e));
+// Some systems end pointer capture when the new window appears; finish at the last position.
+$('#tabs').addEventListener('lostpointercapture', () => {
+  if (!tabDrag.s) return;
+  if (tabDrag.mode === 'pending') tabDrag.lost = true;
+  else finishTabDrag(null);
+});
+
 // ---------- sidebar ----------
 const NAV = [
   ['hosts', 'Hosts', icon.server, () => app.data().hosts.length],
@@ -225,12 +394,13 @@ const NAV = [
 
 function renderSidebar() {
   $('#sidebar').innerHTML =
-    `<div class="brand"><div class="logo">${icon.cloud}</div><span>Nimbus</span></div>` +
+    `<div class="brand"><img class="logo" src="${logoUrl}" alt=""><span>Nimbus</span></div>` +
     NAV.map((n) =>
       n === 'sep'
         ? '<div class="nav-sep"></div>'
         : `<button class="nav-item ${app.view === n[0] ? 'active' : ''}" data-view="${n[0]}" title="${n[1]}">${n[2]}<span class="text">${n[1]}</span>${n[3] ? `<span class="count">${n[4]?.() ? '<span class="alert-dot" title="Something here has expired"></span>' : ''}${n[3]()}</span>` : ''}</button>`,
     ).join('') +
+    (app.data().mcp?.enabled ? `<button class="mcp-on" data-view="settings" title="AI agents can connect (Settings)">${icon.bot}<span class="text">AI agents on</span></button>` : '') +
     `<div class="sidebar-foot">Stored only on this computer<br>v${esc(app.snap.version)}</div>`;
 }
 
@@ -238,7 +408,6 @@ $('#sidebar').addEventListener('click', (e) => {
   const b = e.target.closest('[data-view]');
   if (!b) return;
   app.view = b.dataset.view;
-  if (app.view === 'hosts') app.groupId = null;
   closeDrawer();
   renderSidebar();
   renderContent();
@@ -264,7 +433,13 @@ function renderContent() {
 }
 
 function viewHosts() {
-  const g = app.groupId && app.group(app.groupId);
+  const d = app.data();
+  const groups = [...d.groups].sort(byName);
+  if (app.hostGroupId !== 'all' && app.hostGroupId !== 'none' && !app.group(app.hostGroupId)) app.hostGroupId = 'all';
+  const count = (gid) => d.hosts.filter((h) => (gid === 'none' ? !h.groupId || !app.group(h.groupId) : h.groupId === gid)).length;
+  const chip = (id, label, n, color) => `<button class="chip ${app.hostGroupId === id ? 'active' : ''}" data-act="host-filter" data-id="${esc(id)}">
+      ${color ? `<span class="swatch" style="--c:${esc(color)}"></span>` : ''}${esc(label)}<span class="n">${n}</span></button>`;
+  const g = app.group(app.hostGroupId);
   return `<div class="toolbar">
       <h1>Hosts</h1>
       <label class="search">${icon.search}<input id="search" placeholder="Search, or type user@host and press Enter" value="${esc(app.search)}" spellcheck="false" autocomplete="off"><kbd>${MOD}T</kbd></label>
@@ -275,9 +450,18 @@ function viewHosts() {
       <button class="btn primary" data-act="new-host">${icon.plus} Host</button>
       <button class="btn" data-act="new-group">${icon.folder} Group</button>
     </div>
-    ${g ? `<div class="crumbs"><button data-act="root">All hosts</button>${icon.chevron}<span>${esc(g.name)}</span>
-      <button class="icon-btn" data-act="edit-group" data-id="${esc(g.id)}" title="Edit group">${icon.edit}</button></div>` : ''}
+    ${d.hosts.length || groups.length
+      ? `<div class="chips">${chip('all', 'All', d.hosts.length)}${groups.map((x) => chip(x.id, x.name, count(x.id), x.color || '#8b91a8')).join('')}${groups.length ? chip('none', 'No group', count('none')) : ''}
+          ${g ? `<button class="icon-btn" data-act="edit-group" data-id="${esc(g.id)}" title="Edit group (name, colour, login defaults)">${icon.edit}</button>
+            ${groupDefaults(g) ? `<span class="hint chip-note">${esc(groupDefaults(g))}</span>` : ''}` : ''}</div>`
+      : ''}
     <div id="results"></div>`;
+}
+
+/** "user deploy · port 2222 · key Laptop" for a group's login defaults. */
+function groupDefaults(g) {
+  const k = g.keyId && app.key(g.keyId);
+  return [g.username && `user ${g.username}`, g.port && `port ${g.port}`, k && `key ${k.label}`].filter(Boolean).join(' · ');
 }
 
 function hostCard(h) {
@@ -298,8 +482,9 @@ function hostRow(h, showGroup) {
   const g = h.groupId && app.group(h.groupId);
   const where = hostSubtitle(h).split(', ').slice(1).join(', ');
   const proto = isSerial(h) ? 'Serial' : isSsh(h) ? 'SSH' : h.protocol.toUpperCase();
-  return `<tr class="hrow" data-host="${esc(h.id)}" title="${esc(h.lastConnected ? `Last connected ${timeAgo(h.lastConnected)}` : 'Click to connect')}">
-    <td><div class="h-name"><div class="avatar sm" style="--c:${esc(hostColor(h))}">${esc(initials(h.label || h.address))}</div><span class="title">${esc(h.label || h.address)}</span>${tags}</div></td>
+  return `<tr class="hrow clickable" data-host="${esc(h.id)}" title="${esc(h.lastConnected ? `Last connected ${timeAgo(h.lastConnected)}` : 'Click to connect')}">
+    <td><div class="pw-name"><div class="avatar sm" style="--c:${esc(hostColor(h))}">${esc(initials(h.label || h.address))}</div>
+      <div><div class="title">${esc(h.label || h.address)}${tags}</div>${h.notes ? `<div class="sub">${esc(h.notes.split('\n')[0])}</div>` : ''}</div></div></td>
     <td class="h-addr">${esc(where)}</td>
     <td><span class="proto">${proto}</span></td>
     ${showGroup ? `<td class="faint">${g ? esc(g.name) : ''}</td>` : ''}
@@ -309,34 +494,30 @@ function hostRow(h, showGroup) {
 }
 
 const hostCols = (showGroup) =>
-  `<colgroup><col style="width:${showGroup ? 28 : 34}%"><col style="width:${showGroup ? 28 : 32}%"><col style="width:10%">${showGroup ? '<col style="width:14%">' : ''}<col><col style="width:76px"></colgroup>`;
+  `<colgroup><col style="width:${showGroup ? 30 : 36}%"><col style="width:${showGroup ? 26 : 30}%"><col style="width:10%">${showGroup ? '<col style="width:14%">' : ''}<col><col style="width:92px"></colgroup>`;
 
-function hostsBlock(hosts, showGroup = false) {
-  if (hostsView() === 'grid') return `<div class="grid">${hosts.map(hostCard).join('')}</div>`;
-  return `<table class="list hosts-table">${hostCols(showGroup)}<thead><tr><th>Name</th><th>Address</th><th>Type</th>${showGroup ? '<th>Group</th>' : ''}<th>Last connected</th><th></th></tr></thead>
-    <tbody>${hosts.map((h) => hostRow(h, showGroup)).join('')}</tbody></table>`;
-}
-
-function groupsBlock(groups) {
-  if (hostsView() === 'grid') return `<div class="grid">${groups.map(groupCard).join('')}</div>`;
-  return `<table class="list hosts-table">${hostCols(false)}<tbody>${groups
-    .map((g) => {
-      const n = app.data().hosts.filter((h) => h.groupId === g.id).length;
-      const defaults = [g.username && `user ${g.username}`, g.port && `port ${g.port}`, g.keyId && app.key(g.keyId) && `key ${app.key(g.keyId).label}`].filter(Boolean).join(' · ');
-      return `<tr class="hrow" data-group="${esc(g.id)}"><td><div class="h-name"><div class="avatar sm" style="--c:${esc(g.color || '#8b91a8')}">${icon.folder}</div><span class="title">${esc(g.name)}</span></div></td>
-        <td class="faint">${n} host${n === 1 ? '' : 's'}</td><td class="faint" colspan="2">${esc(defaults)}</td>
-        <td class="row-actions"><button class="icon-btn" data-act="edit-group" data-id="${esc(g.id)}" title="Edit">${icon.edit}</button></td></tr>`;
-    })
+/**
+ * Hosts as cards or table rows, like the Passwords list: with `sections` (the All filter, when
+ * there are groups) one titled section per group, then the hosts without one.
+ */
+function hostsBlock(hosts, { showGroup = false, sections = false } = {}) {
+  const groups = sections ? [...app.data().groups].sort(byName) : [];
+  const parts = sections
+    ? [...groups.map((g) => ({ g, title: g.name, color: g.color || '#8b91a8', list: hosts.filter((h) => h.groupId === g.id) })),
+       { g: null, title: 'No group', color: null, list: hosts.filter((h) => !h.groupId || !app.group(h.groupId)) }].filter((p) => p.list.length)
+    : [{ list: hosts }];
+  const head = (p, inTable) => {
+    const label = `${p.color ? `<span class="swatch" style="--c:${esc(p.color)}"></span>` : ''}${esc(p.title)} <span class="n">${p.list.length}</span>`;
+    const attrs = p.g ? `data-group-head="${esc(p.g.id)}" title="Show only ${esc(p.title)}"` : '';
+    return inTable ? `<tr class="group-row" ${attrs}><td colspan="${showGroup ? 6 : 5}">${label}</td></tr>` : `<div class="section-title group-head" ${attrs}>${label}</div>`;
+  };
+  if (hostsView() === 'grid') {
+    return parts.map((p) => `${p.title ? head(p, false) : ''}<div class="grid">${p.list.map(hostCard).join('')}</div>`).join('');
+  }
+  const thead = `<thead><tr><th>Name</th><th>Address</th><th>Type</th>${showGroup ? '<th>Group</th>' : ''}<th>Last connected</th><th></th></tr></thead>`;
+  return `<table class="list pw-table hosts-table">${hostCols(showGroup)}${thead}<tbody>${parts
+    .map((p) => (p.title ? head(p, true) : '') + p.list.map((h) => hostRow(h, showGroup)).join(''))
     .join('')}</tbody></table>`;
-}
-
-function groupCard(g) {
-  const n = app.data().hosts.filter((h) => h.groupId === g.id).length;
-  return `<div class="card clickable" data-group="${esc(g.id)}">
-    <div class="avatar" style="--c:${esc(g.color || '#8b91a8')}">${icon.folder}</div>
-    <div class="meta"><div class="title">${esc(g.name)}</div><div class="sub">${n} host${n === 1 ? '' : 's'}</div></div>
-    <div class="actions"><button class="icon-btn" data-act="edit-group" data-id="${esc(g.id)}" title="Edit">${icon.edit}</button></div>
-  </div>`;
 }
 
 // [ssh|sftp|ftp|ftps://][user@]host[:port]
@@ -349,28 +530,27 @@ function searchMatches() {
     .sort(byName);
 }
 
+const inHostFilter = (h) => {
+  const gid = app.hostGroupId;
+  return gid === 'all' || (gid === 'none' ? !h.groupId || !app.group(h.groupId) : h.groupId === gid);
+};
+
 function renderResults() {
   const r = $('#results');
   if (!r) return;
   const d = app.data();
   const q = app.search.trim();
+  const groups = d.groups.length > 0;
   if (q) {
-    const hits = searchMatches();
+    const hits = searchMatches().filter(inHostFilter);
     const quick = QUICK.exec(q);
     r.innerHTML =
-      (hits.length ? `<div class="section-title">Results</div>${hostsBlock(hits, true)}` : '') +
+      (hits.length ? hostsBlock(hits, { showGroup: app.hostGroupId === 'all' && groups }) : '') +
       (quick && (q.includes('@') || !hits.length)
         ? `<div class="panel"><h2>Quick connect</h2><p>Press <strong>Enter</strong> to connect to <code>${esc(q)}</code>. It will be saved to your hosts so you can reconnect later.</p>
             <p class="hint">Start with <code>sftp://</code>, <code>ftp://</code> or <code>ftps://</code> to open the file browser instead of a terminal.</p></div>`
         : '') +
       (!hits.length && !quick ? `<div class="empty"><p>No hosts match “${esc(q)}”.</p></div>` : '');
-    return;
-  }
-  if (app.groupId) {
-    const hosts = d.hosts.filter((h) => h.groupId === app.groupId).sort(byName);
-    r.innerHTML = hosts.length
-      ? hostsBlock(hosts)
-      : `<div class="empty"><p>This group is empty.</p><div class="row"><button class="btn primary" data-act="new-host">${icon.plus} Add a host here</button></div></div>`;
     return;
   }
   if (!d.hosts.length && !d.groups.length) {
@@ -381,11 +561,13 @@ function renderResults() {
       <button class="btn" data-act="import-file">${icon.upload} Import a Nimbus file</button></div></div>`;
     return;
   }
-  const groups = [...d.groups].sort(byName);
-  const loose = d.hosts.filter((h) => !h.groupId || !app.group(h.groupId)).sort(byName);
-  r.innerHTML =
-    (groups.length ? `<div class="section-title">Groups</div>${groupsBlock(groups)}` : '') +
-    (loose.length ? `<div class="section-title">Hosts</div>${hostsBlock(loose)}` : '');
+  const list = d.hosts.filter(inHostFilter).sort(byName);
+  if (!list.length) {
+    r.innerHTML = `<div class="empty"><p>${d.hosts.length ? 'No hosts in this group yet.' : 'No hosts yet.'}</p>
+      <div class="row"><button class="btn primary" data-act="new-host">${icon.plus} Add one</button></div></div>`;
+    return;
+  }
+  r.innerHTML = hostsBlock(list, { sections: app.hostGroupId === 'all' && groups });
 }
 
 function viewPasswords() {
@@ -753,10 +935,203 @@ function viewSettings() {
       <div class="field-row"><label class="field"><span>SSH agent socket</span><input name="agentSocket" value="${esc(s.agentSocket || '')}" placeholder="${esc(agentHint)}" spellcheck="false"></label>
       <label class="field"><span>Keep-alive (s)</span><input type="number" name="keepaliveSecs" min="0" max="600" value="${s.keepaliveSecs}"></label></div>
       <p class="hint">Use the agent socket for 1Password, Secretive or a custom agent. Keep-alive 0 turns it off.</p>
-    </form>`;
+    </form>
+    <div class="panel" id="mcp-panel">${mcpPanel()}</div>`;
+}
+
+// ---------- AI agents (MCP) ----------
+const MCP_POLICY = { ask: 'Ask me every time', allow: 'Allow without asking' };
+const MCP_TOOLS = { run_command: 'Ran a command', http_request: 'Called an API', get_secret: 'Asked for a secret' };
+
+function mcpAccessSummary(a) {
+  const d = app.data();
+  const n = (ids, groupIds, items) => items.filter((x) => ids.includes(x.id) || (x.groupId && groupIds.includes(x.groupId))).length;
+  const hosts = n(a.hosts, a.hostGroups, d.hosts.filter(isSsh));
+  const creds = n(a.passwords, a.passwordGroups, d.passwords) + n(a.apiKeys, a.apiGroups, d.apiKeys);
+  if (!hosts && !creds) return 'Nothing yet';
+  return [hosts && `${hosts} host${hosts === 1 ? '' : 's'}`, creds && `${creds} credential${creds === 1 ? '' : 's'}`].filter(Boolean).join(', ');
+}
+
+function mcpPanel() {
+  const m = app.data().mcp;
+  const st = app.mcpStatus;
+  const agents = [...m.agents].sort(byName);
+  const status = !m.enabled ? '<span class="faint">Off. Agents can\'t reach Nimbus.</span>'
+    : st?.error ? `<span class="danger-text">Not running: ${esc(st.error)}</span>`
+    : st?.running ? `<span class="ok-text">● Listening on <code class="selectable">${esc(st.url)}</code> (this computer only)</span>`
+    : '<span class="faint">Starting…</span>';
+  const log = (app.mcpLog || []).slice(0, 40);
+  const outcome = { ok: ['ok', 'Done'], failed: ['warn', 'Failed'], denied: ['danger', 'Declined'], refused: ['danger', 'Blocked'] };
+  return `<h2>${icon.bot.replace('<svg', '<svg style="width:16px;height:16px;vertical-align:-3px"')} AI agents (MCP)</h2>
+    <p>Let AI assistants such as Claude Desktop, Claude Code, Grok or Cursor run commands on your hosts and call APIs with your saved credentials, through the Model Context Protocol.</p>
+    <ul class="mcp-points hint">
+      <li>An agent can only use the hosts and credentials you give it, and can't change anything in Nimbus.</li>
+      <li>Secrets stay in Nimbus: it logs in, answers sudo and adds API keys itself, and only sends a key to that key's own site.</li>
+      <li>By default you approve every command and request here first, and everything is logged below.</li>
+    </ul>
+    <label class="check"><input type="checkbox" id="mcp-enabled" ${m.enabled ? 'checked' : ''}><span>Allow AI agents to connect<small>${status}</small></span></label>
+    <div class="field-row" style="max-width:420px"><label class="field"><span>Port</span><input type="number" id="mcp-port" min="1024" max="65535" value="${m.port}"></label><div></div></div>
+    <div class="section-title" style="margin-top:18px">Agents <div class="spacer"></div><button class="btn small" data-act="mcp-new-agent">${icon.plus} Agent</button></div>
+    ${agents.length
+      ? `<table class="list pw-table mcp-agents"><thead><tr><th>Agent</th><th>Can use</th><th>Commands</th><th>API requests</th><th>Last used</th><th></th></tr></thead><tbody>${agents
+          .map((a) => `<tr class="clickable" data-agent="${esc(a.id)}">
+            <td><div class="pw-name"><div class="avatar sm" style="--c:${a.paused ? 'var(--faint)' : '#14b8a6'}">${icon.bot}</div><div><div class="title">${esc(a.name)}</div><div class="sub">${a.paused ? 'Paused' : `Token …${esc(a.tokenHint)}`}${a.reveal ? ' · may ask to see secrets' : ''}</div></div></div></td>
+            <td>${esc(mcpAccessSummary(a))}</td>
+            <td class="${a.commands === 'allow' ? 'warn-text' : 'faint'}">${a.commands === 'allow' ? 'Without asking' : 'Ask me'}</td>
+            <td class="${a.requests === 'allow' ? 'warn-text' : 'faint'}">${a.requests === 'allow' ? 'Without asking' : 'Ask me'}</td>
+            <td class="faint">${a.lastUsed ? esc(timeAgo(a.lastUsed)) : 'Never'}</td>
+            <td class="row-actions"><button class="icon-btn" data-act="mcp-edit-agent" data-id="${esc(a.id)}" title="Edit">${icon.edit}</button></td></tr>`)
+          .join('')}</tbody></table>`
+      : '<p class="hint">No agents yet. Add one for each AI app you use, so each gets its own token and its own access.</p>'}
+    <div class="section-title" style="margin-top:22px">Recent activity <div class="spacer"></div>${log.length ? `<button class="btn small" data-act="mcp-clear-log">Clear</button>` : ''}</div>
+    ${log.length
+      ? `<table class="list mcp-log"><tbody>${log
+          .map((x) => `<tr title="${esc(new Date(x.time).toLocaleString())}${x.message ? `\n${esc(x.message)}` : ''}">
+            <td class="faint">${esc(timeAgo(x.time))}</td><td>${esc(x.agent)}</td>
+            <td>${esc(MCP_TOOLS[x.tool] || x.tool)}${x.target ? ` · <strong>${esc(x.target)}</strong>` : ''}<div class="mono sub">${esc(x.detail)}</div></td>
+            <td><span class="badge ${outcome[x.outcome]?.[0] || ''}">${outcome[x.outcome]?.[1] || esc(x.outcome)}</span></td></tr>`)
+          .join('')}</tbody></table>`
+      : '<p class="hint">Nothing yet. Commands, API requests and secret requests from agents appear here.</p>'}`;
+}
+
+function renderMcpPanel() {
+  const el = $('#mcp-panel');
+  if (el) el.innerHTML = mcpPanel();
+}
+
+async function refreshMcp() {
+  try {
+    [app.mcpStatus, app.mcpLog] = await Promise.all([api.mcpStatus(), api.mcpActivity()]);
+  } catch (e) {
+    app.mcpStatus = { error: String(e) };
+  }
+  renderMcpPanel();
+}
+
+async function mcpConfigure() {
+  const enabled = $('#mcp-enabled').checked;
+  const port = parseInt($('#mcp-port').value, 10) || 47821;
+  try {
+    app.mcpStatus = await api.mcpConfigure(enabled, port);
+    app.snap = await api.state();
+    renderSidebar();
+    renderMcpPanel();
+    if (enabled && app.mcpStatus.running) toast('AI agents can now connect to Nimbus', 'ok');
+  } catch (e) {
+    toast(String(e), 'error');
+    refreshMcp();
+  }
+}
+
+/** Setup for one agent: its token (shown once) and ready-to-paste config for common apps. */
+async function mcpSetupDialog(agent, token) {
+  const st = app.mcpStatus || (await api.mcpStatus().catch(() => ({})));
+  const port = st.port || app.data().mcp.port;
+  const url = `http://127.0.0.1:${port}/mcp`;
+  const exe = st.exe || 'Nimbus';
+  const slug = 'nimbus';
+  const blocks = [
+    ['Claude Code', 'Run this in a terminal:', `claude mcp add --transport http ${slug} ${url} --header "Authorization: Bearer ${token}"`],
+    ['Claude Desktop, Cursor, and apps that start a command', 'Add this to the app\'s MCP config (for Claude Desktop: Settings → Developer → Edit Config), then restart the app:',
+      JSON.stringify({ mcpServers: { [slug]: { command: exe, args: ['--mcp'], env: { NIMBUS_MCP_TOKEN: token, NIMBUS_MCP_PORT: String(port) } } } }, null, 2)],
+    ['Any other agent (Grok, custom scripts, …)', 'Use the Streamable HTTP transport with this URL and header:', `URL:    ${url}\nHeader: Authorization: Bearer ${token}`],
+  ];
+  await modal({
+    title: `Connect ${agent.name}`,
+    html: `<p><strong>Copy this now.</strong> Nimbus keeps only a fingerprint of the token, so it can't show it again. You can make a new one at any time from the agent's settings, which stops the old one working.</p>
+      ${app.data().mcp.enabled ? '' : '<p class="warnbox">AI agent access is turned off. Turn on “Allow AI agents to connect” in Settings before the agent can reach Nimbus.</p>'}
+      ${blocks.map(([title, note, text], i) => `<div class="setup-block"><div class="setup-head"><strong>${esc(title)}</strong><button type="button" class="btn small" data-copy="${i}">${icon.copy} Copy</button></div>
+        <p class="hint">${esc(note)}</p><pre class="snippet selectable">${esc(text)}</pre></div>`).join('')}
+      <p class="hint">The agent can't use anything until you grant it hosts or credentials. Next you'll choose what it can use.</p>`,
+    buttons: [{ label: 'Done', value: 'ok', kind: 'primary', submit: true }],
+    init: (form) => {
+      form.classList.add('wide');
+      form.querySelectorAll('[data-copy]').forEach((b) => (b.onclick = async () => {
+        await writeText(blocks[b.dataset.copy][2]);
+        toast('Copied. It holds the agent token, so keep it private.', 'ok');
+      }));
+    },
+  });
+}
+
+async function mcpNewAgent() {
+  const r = await modal({
+    title: 'Add an AI agent',
+    html: `<p>Give each AI app its own agent, so you can see who did what and switch one off without the others.</p>
+      <label class="field"><span>Name</span><input name="name" list="mcp-names" placeholder="e.g. Claude Code" autofocus></label>
+      <datalist id="mcp-names">${['Claude Code', 'Claude Desktop', 'Grok', 'Cursor', 'ChatGPT', 'Codex'].map((n) => `<option value="${n}">`).join('')}</datalist>`,
+    buttons: [{ label: 'Cancel', value: 'cancel' }, { label: 'Create', value: 'ok', kind: 'primary', submit: true }],
+  });
+  if (r.action !== 'ok' || !r.values.name.trim()) return;
+  try {
+    const res = await api.mcpCreateAgent(r.values.name.trim());
+    setSnap(res.state);
+    await mcpSetupDialog(app.data().mcp.agents.find((a) => a.id === res.id), res.token);
+    openDrawer('agent', res.id);
+  } catch (e) {
+    toast(String(e), 'error');
+  }
+}
+
+/** Approval dialogs, one at a time, oldest first. */
+const approvals = { queue: [], current: null };
+
+function queueApproval(req) {
+  approvals.queue.push(req);
+  showNextApproval();
+}
+
+function closeApproval(id) {
+  approvals.queue = approvals.queue.filter((r) => r.id !== id);
+  if (approvals.current?.req.id === id) approvals.current.ctl.cancel?.();
+}
+
+async function showNextApproval() {
+  if (approvals.current || !approvals.queue.length) return;
+  const req = approvals.queue.shift();
+  const ctl = {};
+  approvals.current = { req, ctl };
+  const deadline = Date.now() + (req.timeoutSecs || 120) * 1000;
+  const reveal = req.kind === 'reveal';
+  const label = { command: 'Command', request: 'Request', reveal: 'Reason given' }[req.kind] || 'Details';
+  let timer;
+  const r = await modal({
+    title: req.title,
+    html: `<div class="approval">
+      <p class="approval-target">${req.kind === 'command' ? icon.terminal : req.kind === 'request' ? icon.zap : icon.lock}<span>${esc(req.target)}</span>${req.sudo ? '<span class="badge warn">sudo</span>' : ''}</p>
+      <div class="legend">${label}</div><pre class="snippet selectable">${esc(req.body)}</pre>
+      ${reveal ? `<p class="warnbox">If you allow this, ${esc(req.agent)} sees the secret itself and could keep or share it. Only allow it if there's no other way.</p>` : ''}
+      ${req.kind === 'command' ? '<p class="hint">It runs with the saved login, as if you typed it. Check it does what you expect.</p>' : ''}
+      <p class="hint approval-timer"></p></div>`,
+    ctl,
+    buttons: [
+      { label: 'Deny', value: 'deny' },
+      ...(req.remember ? [{ label: 'Allow for 30 min', value: 'remember' }] : []),
+      { label: reveal ? 'Show it to the agent' : 'Allow once', value: 'once', kind: reveal ? 'danger solid' : 'primary' },
+    ],
+    init: (form) => {
+      form.classList.add('wide');
+      const t = form.querySelector('.approval-timer');
+      const tick = () => {
+        const left = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+        t.textContent = `Nimbus says no on its own in ${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}.${req.remember ? ' “Allow for 30 min” covers the same kind of action on this target.' : ''}`;
+      };
+      tick();
+      timer = setInterval(tick, 1000);
+    },
+  });
+  clearInterval(timer);
+  const decision = { once: 'once', remember: 'remember' }[r.action] || 'deny';
+  api.mcpDecide(req.id, decision).catch(() => {});
+  approvals.current = null;
+  showNextApproval();
 }
 
 function wireSettings() {
+  refreshMcp();
+  $('#mcp-panel').addEventListener('change', (e) => {
+    if (e.target.id === 'mcp-enabled' || e.target.id === 'mcp-port') mcpConfigure();
+  });
   const form = $('#settings-form');
   let t;
   form.addEventListener('change', (e) => {
@@ -852,10 +1227,11 @@ content.addEventListener('click', async (e) => {
     e.stopPropagation();
     return onAction(actEl.dataset.act, actEl.dataset.id, actEl);
   }
+  const head = e.target.closest('[data-group-head]');
+  if (head) { app.hostGroupId = head.dataset.groupHead; return renderContent(); }
   const card = e.target.closest('.card, .hrow');
   if (!card) return;
   if (card.dataset.host) app.connect(card.dataset.host);
-  else if (card.dataset.group) { app.groupId = card.dataset.group; app.search = ''; renderContent(); }
   else if (card.dataset.key) openDrawer('key', card.dataset.key);
   else if (card.dataset.snippet) openDrawer('snippet', card.dataset.snippet);
   else if (card.dataset.password) openDrawer('password', card.dataset.password);
@@ -867,6 +1243,8 @@ content.addEventListener('click', (e) => {
   if (row) openDrawer('password', row.dataset.password);
   const apiRowEl = e.target.closest('tr[data-api]');
   if (apiRowEl) openDrawer('apikey', apiRowEl.dataset.api);
+  const agentRow = e.target.closest('tr[data-agent]');
+  if (agentRow) openDrawer('agent', agentRow.dataset.agent);
 });
 
 content.addEventListener('contextmenu', (e) => {
@@ -874,6 +1252,17 @@ content.addEventListener('contextmenu', (e) => {
   if (apiRowEl && !e.target.closest('.selectable')) {
     e.preventDefault();
     return apiCopyMenu(e.clientX, e.clientY, apiRowEl.dataset.api);
+  }
+  const head = e.target.closest('[data-group-head], .chip[data-act=host-filter]');
+  const gid = head?.dataset.groupHead || head?.dataset.id;
+  if (gid && app.group(gid)) {
+    e.preventDefault();
+    return contextMenu(e.clientX, e.clientY, [
+      { label: 'Show only this group', icon: icon.folder, action: () => { app.hostGroupId = gid; renderContent(); } },
+      { label: 'Edit group', icon: icon.edit, action: () => openDrawer('group', gid) },
+      'sep',
+      { label: 'Delete group', icon: icon.trash, danger: true, action: () => deleteGroup(gid) },
+    ]);
   }
   const card = e.target.closest('.card, .hrow');
   if (!card) return;
@@ -888,14 +1277,6 @@ content.addEventListener('contextmenu', (e) => {
       { label: 'Duplicate', icon: icon.copy, action: () => run(() => api.duplicateHost(id)) },
       'sep',
       { label: 'Delete', icon: icon.trash, danger: true, action: () => deleteHost(id) },
-    ]);
-  } else if (card.dataset.group) {
-    const id = card.dataset.group;
-    contextMenu(e.clientX, e.clientY, [
-      { label: 'Open', icon: icon.folder, action: () => { app.groupId = id; renderContent(); } },
-      { label: 'Edit', icon: icon.edit, action: () => openDrawer('group', id) },
-      'sep',
-      { label: 'Delete group', icon: icon.trash, danger: true, action: () => deleteGroup(id) },
     ]);
   }
 });
@@ -942,7 +1323,12 @@ async function onAction(act, id, el) {
     case 'edit-host': return openDrawer('host', id);
     case 'new-group': return openDrawer('group', null);
     case 'edit-group': return openDrawer('group', id);
-    case 'root': app.groupId = null; return renderContent();
+    case 'mcp-new-agent': return mcpNewAgent();
+    case 'mcp-edit-agent': return openDrawer('agent', id);
+    case 'mcp-clear-log':
+      await api.mcpClearActivity();
+      return refreshMcp();
+    case 'host-filter': app.hostGroupId = id; return renderContent();
     case 'new-key': return openDrawer('key', null);
     case 'copy-pub': return copyPub(id);
     case 'new-snippet': return openDrawer('snippet', null);
@@ -982,7 +1368,7 @@ async function deleteGroup(id) {
   const n = app.data().hosts.filter((h) => h.groupId === id).length;
   if (await confirmDialog('Delete group?', `<strong>${esc(g.name)}</strong> will be removed. ${n ? `Its ${n} host${n === 1 ? '' : 's'} will be kept and moved out of the group.` : ''}`)) {
     await run(() => api.deleteGroup(id));
-    if (app.groupId === id) app.groupId = null;
+    if (app.hostGroupId === id) app.hostGroupId = 'all';
     closeDrawer();
     renderContent();
   }
@@ -1047,7 +1433,7 @@ async function doImport() {
   if (ok) {
     toast(`Imported ${p.hosts} hosts, ${p.passwords} passwords and ${p.apiKeys} API credentials`, 'ok');
     app.view = 'hosts';
-    app.groupId = null;
+    app.hostGroupId = 'all';
     renderSidebar();
     renderContent();
   }
@@ -1075,7 +1461,7 @@ const drawer = $('#drawer');
 function openDrawer(kind, id) {
   app.drawer = { kind, id };
   drawer.hidden = false;
-  drawer.innerHTML = { host: hostForm, group: groupForm, key: keyForm, snippet: snippetForm, password: passwordForm, pwgroup: pwGroupForm, apigroup: apiGroupForm, apikey: apiKeyForm }[kind](id);
+  drawer.innerHTML = { host: hostForm, group: groupForm, key: keyForm, snippet: snippetForm, password: passwordForm, pwgroup: pwGroupForm, apigroup: apiGroupForm, apikey: apiKeyForm, agent: agentForm }[kind](id);
   wireDrawer(kind, id);
   drawer.querySelector('[autofocus]')?.focus();
 }
@@ -1102,7 +1488,7 @@ function drawerShell(title, body, foot) {
 }
 
 function hostForm(id) {
-  const h = (id && app.host(id)) || { groupId: app.groupId, useAgent: true, tags: [], protocol: 'ssh' };
+  const h = (id && app.host(id)) || { groupId: app.group(app.hostGroupId) ? app.hostGroupId : null, useAgent: true, tags: [], protocol: 'ssh' };
   const d = app.data();
   const g = h.groupId && app.group(h.groupId);
   const hasPw = id && app.flags(id).password;
@@ -1322,6 +1708,53 @@ function apiKeyForm(id) {
   );
 }
 
+/** Checkboxes for one kind of item: whole groups (including items added later) and single items. */
+function grantPicker(kind, title, groups, items, groupIds, itemIds, sub) {
+  const sorted = [...groups].sort(byName);
+  const loose = items.filter((x) => !x.groupId || !groups.some((g) => g.id === x.groupId)).sort(byName);
+  const item = (x, g) => `<label class="grant-item ${g ? 'in-group' : ''}"><input type="checkbox" data-grant="${kind}" value="${esc(x.id)}" ${itemIds.includes(x.id) ? 'checked' : ''} ${g ? `data-group="${esc(g.id)}"` : ''}>
+      <span>${esc(x.label || x.name)}<small>${esc(sub(x))}</small></span></label>`;
+  const n = items.filter((x) => itemIds.includes(x.id) || (x.groupId && groupIds.includes(x.groupId))).length;
+  return `<details class="grant" ${n ? 'open' : ''}><summary>${esc(title)} <span class="n">${n} of ${items.length}</span></summary>
+    ${!items.length && !groups.length ? '<p class="hint">Nothing saved yet.</p>' : ''}
+    ${sorted.map((g) => {
+      const members = items.filter((x) => x.groupId === g.id).sort(byName);
+      return `<div class="grant-group"><label class="grant-item"><input type="checkbox" data-grant-group="${kind}" value="${esc(g.id)}" ${groupIds.includes(g.id) ? 'checked' : ''}>
+        <span><span class="swatch" style="--c:${esc(g.color || '#8b91a8')}"></span> All of ${esc(g.name)}<small>${members.length} now, plus any added later</small></span></label>
+        ${members.map((x) => item(x, g)).join('')}</div>`;
+    }).join('')}
+    ${loose.map((x) => item(x, null)).join('')}</details>`;
+}
+
+function agentForm(id) {
+  const a = app.data().mcp.agents.find((x) => x.id === id);
+  if (!a) return drawerShell('Agent', '<p>This agent no longer exists.</p>', '');
+  const d = app.data();
+  const seg = (name, value) => `<div class="segmented two">${Object.entries(MCP_POLICY).map(([v, l]) => `<label><input type="radio" name="${name}" value="${v}" ${(value || 'ask') === v ? 'checked' : ''}><span>${l}</span></label>`).join('')}</div>`;
+  return drawerShell(
+    'AI agent',
+    `<div class="fieldset"><label class="field"><span>Name</span><input name="name" value="${esc(a.name)}" autofocus></label>
+      <label class="check"><input type="checkbox" name="paused" ${a.paused ? 'checked' : ''}><span>Paused<small>Turn the agent away without removing it.</small></span></label></div>
+    <div class="fieldset"><div class="legend">What it can use</div>
+      <p class="hint" style="margin:0 0 10px">It sees names, addresses and usernames, never notes or secret values.</p>
+      ${grantPicker('host', 'Hosts (SSH)', d.groups, d.hosts.filter(isSsh), a.hostGroups, a.hosts, (h) => `${h.username ? `${h.username}@` : ''}${h.address}`)}
+      ${grantPicker('password', 'Passwords', d.passwordGroups, d.passwords, a.passwordGroups, a.passwords, (p) => [p.username, p.url].filter(Boolean).join(' · ') || 'No website, so it can only be revealed')}
+      ${grantPicker('api', 'API credentials', d.apiGroups, d.apiKeys, a.apiGroups, a.apiKeys, (k) => [API_KINDS[k.kind]?.label, k.baseUrl || 'no base URL'].filter(Boolean).join(' · '))}
+    </div>
+    <div class="fieldset"><div class="legend">Approvals</div>
+      <div class="field"><span>Running commands on a host</span>${seg('commands', a.commands)}</div>
+      <div class="field"><span>API and web requests with a credential</span>${seg('requests', a.requests)}</div>
+      <p class="hint">“Allow without asking” is convenient, but anyone with this agent's token could then run commands on its hosts with no prompt.</p>
+      <label class="check"><input type="checkbox" name="reveal" ${a.reveal ? 'checked' : ''}><span>Let it ask to see a secret value<small>For things that can't be done another way, like a web login. You approve every one, and the agent keeps what it sees.</small></span></label>
+    </div>
+    <div class="fieldset"><div class="legend">Token</div>
+      <p class="hint" style="margin:0 0 10px">The token ends in <code>…${esc(a.tokenHint)}</code>. Lost it, or think it leaked? Make a new one: the old one stops working straight away.</p>
+      <button type="button" class="btn" data-dact="agent-token">${icon.refresh} New token and setup…</button></div>`,
+    `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button><div class="spacer"></div>
+     <button type="button" class="btn" data-dact="close">Cancel</button><button type="submit" class="btn primary">Save</button>`,
+  );
+}
+
 function snippetForm(id) {
   const s = (id && app.snippet(id)) || { run: true };
   return drawerShell(
@@ -1436,6 +1869,18 @@ function wireDrawer(kind, id) {
         closeDrawer();
         if (!id) { app.pwGroupId = group.id; renderContent(); }
       }
+    } else if (kind === 'agent') {
+      const prev = app.data().mcp.agents.find((x) => x.id === id);
+      const picked = (sel) => [...form.querySelectorAll(sel)].filter((c) => c.checked && !c.disabled).map((c) => c.value);
+      const agent = {
+        ...prev, name: val('name'), paused: checked('paused'), reveal: checked('reveal'),
+        commands: form.querySelector('input[name=commands]:checked')?.value || 'ask',
+        requests: form.querySelector('input[name=requests]:checked')?.value || 'ask',
+        hosts: picked('[data-grant=host]'), hostGroups: picked('[data-grant-group=host]'),
+        passwords: picked('[data-grant=password]'), passwordGroups: picked('[data-grant-group=password]'),
+        apiKeys: picked('[data-grant=api]'), apiGroups: picked('[data-grant-group=api]'),
+      };
+      if (await run(() => api.mcpSaveAgent(agent), 'Agent saved')) { closeDrawer(); refreshMcp(); }
     } else if (kind === 'snippet') {
       if (!val('command')) return toast('Enter a command', 'error');
       const snippet = { id: id || uid(), name: val('name'), command: form.elements.command.value.replace(/\s+$/, ''), run: checked('run') };
@@ -1495,6 +1940,23 @@ function wireDrawer(kind, id) {
     sync();
   }
 
+  if (kind === 'agent') {
+    // Items inside a granted group are covered by it.
+    const syncGroups = () => form.querySelectorAll('[data-grant-group]').forEach((g) => {
+      form.querySelectorAll(`[data-grant="${g.dataset.grantGroup}"][data-group="${g.value}"]`).forEach((c) => {
+        c.disabled = g.checked;
+        if (g.checked) c.checked = true;
+        else if (c.dataset.wasChecked !== undefined) c.checked = c.dataset.wasChecked === '1';
+      });
+    });
+    form.querySelectorAll('[data-grant]').forEach((c) => (c.dataset.wasChecked = c.checked ? '1' : '0'));
+    form.addEventListener('change', (e) => {
+      if (e.target.matches('[data-grant]')) e.target.dataset.wasChecked = e.target.checked ? '1' : '0';
+      if (e.target.matches('[data-grant-group]')) syncGroups();
+    });
+    syncGroups();
+  }
+
   form.addEventListener('submit', (e) => { e.preventDefault(); save(); });
   form.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); closeDrawer(); }
@@ -1534,6 +1996,18 @@ function wireDrawer(kind, id) {
       apiCopyMenu(r.left, r.top - 8, id, true);
     }
     else if (act === 'copy-pub') copyPub(id);
+    else if (act === 'agent-token') {
+      const a = app.data().mcp.agents.find((x) => x.id === id);
+      if (!(await confirmDialog('Make a new token?', `<strong>${esc(a.name)}</strong> stops working until you paste the new token into it.`, 'New token', 'primary'))) return;
+      try {
+        const res = await api.mcpRegenerateToken(id);
+        app.snap = res.state;
+        await mcpSetupDialog(a, res.token);
+        openDrawer('agent', id);
+      } catch (err) {
+        toast(String(err), 'error');
+      }
+    }
     else if (act === 'delete') {
       if (kind === 'host') deleteHost(id);
       else if (kind === 'group') deleteGroup(id);
@@ -1559,6 +2033,11 @@ function wireDrawer(kind, id) {
         const n = app.data().passwords.filter((p) => p.groupId === id).length;
         if (await confirmDialog('Delete group?', `<strong>${esc(g?.name)}</strong> will be removed.${n ? ` Its ${n} password${n === 1 ? '' : 's'} will be kept and moved out of the group.` : ''}`)) {
           if (await run(() => api.deletePasswordGroup(id))) { closeDrawer(); app.pwGroupId = 'all'; renderContent(); }
+        }
+      } else if (kind === 'agent') {
+        const a = app.data().mcp.agents.find((x) => x.id === id);
+        if (await confirmDialog('Remove agent?', `<strong>${esc(a?.name)}</strong> loses access straight away. Its activity stays in the log.`, 'Remove')) {
+          if (await run(() => api.mcpDeleteAgent(id))) { closeDrawer(); refreshMcp(); }
         }
       } else if (kind === 'password') {
         if (await confirmDialog('Delete password?', `<strong>${esc(app.password(id)?.name)}</strong> will be removed from this computer.`)) {
@@ -1633,7 +2112,8 @@ function shortcutFor(e) {
 }
 
 function doShortcut(name) {
-  const list = [null, ...app.sessions];
+  const list = isTabWindow ? [...app.sessions] : [null, ...app.sessions];
+  if (isTabWindow && name === 'new-tab') return api.focusWindow('main');
   const i = list.indexOf(app.active);
   if (name === 'new-tab') {
     app.activate(null);
@@ -1673,8 +2153,40 @@ window.addEventListener(
   true,
 );
 
+// AI agents: approvals pop up wherever you are; activity updates the Settings list.
+onEvent('mcp-approval', (e) => queueApproval(e.payload));
+onEvent('mcp-approval-closed', (e) => closeApproval(e.payload));
+onEvent('mcp-activity', (e) => {
+  app.mcpLog = [e.payload, ...(app.mcpLog || [])].slice(0, 200);
+  if (app.view === 'settings' && !app.active) renderMcpPanel();
+});
+if (import.meta.env.DEV) window.__nimbus = { queueApproval, closeApproval, app, windowLabel, api };
+
 // macOS menu accelerators (⌘T, ⌘W, …) arrive from the native menu instead of as key events.
-listen('menu', (e) => { if (!modalOpen()) doShortcut(e.payload); });
+onEvent('menu', (e) => { if (!modalOpen()) doShortcut(e.payload); });
+
+// Tabs moving between windows.
+onEvent('tab-adopt', (e) => app.adoptTab(e.payload));
+onEvent('tab-release', (e) => {
+  const s = app.sessions.find((x) => x.sid === e.payload.sessionId);
+  if (s) app.releaseTab(s, e.payload.target);
+});
+onEvent('tab-drop-hover', (e) => document.body.classList.toggle('tab-drop-target', !!e.payload));
+
+// Another window saved something: pick it up (the window you're typing in already has it).
+async function refreshFromBackend() {
+  try {
+    const snap = await api.state();
+    if (snap.rev === app.snap?.rev) return;
+    const themeChanged = snap.data.settings.theme !== app.settings().theme;
+    setSnap(snap);
+    if (themeChanged) applyTheme();
+    app.sessions.forEach((x) => x.applySettings(app.settings()));
+    renderTabs();
+  } catch { /* ignore */ }
+}
+onEvent('state-changed', (e) => { if (e.payload > (app.snap?.rev ?? 0) && !document.hasFocus()) refreshFromBackend(); });
+window.addEventListener('focus', () => refreshFromBackend());
 
 // Any web link opens in the default browser, never inside Nimbus (the Rust side also blocks
 // in-app navigation as a backstop).
@@ -1698,6 +2210,7 @@ document.addEventListener('contextmenu', (e) => {
     applyTheme();
     renderTabs();
     listenForFileDrops(app);
+    if (window.__NIMBUS_ADOPT__) app.adoptTab(window.__NIMBUS_ADOPT__);
   } catch (e) {
     document.body.innerHTML = `<div class="empty"><h2>Nimbus couldn't start</h2><p class="selectable">${esc(String(e))}</p></div>`;
   }

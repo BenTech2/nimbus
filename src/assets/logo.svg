@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 100 824 824">
+  <!-- The app icon (src-tauri/icons/icon.svg) cropped to its tile, without shadows, for small sizes in the UI. -->
+  <defs>
+    <linearGradient id="bg" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#5aa0ff"/>
+      <stop offset="0.55" stop-color="#4f7dff"/>
+      <stop offset="1" stop-color="#7a4dff"/>
+    </linearGradient>
+    <linearGradient id="ink" gradientUnits="userSpaceOnUse" x1="380" y1="520" x2="640" y2="680">
+      <stop offset="0" stop-color="#3f7cff"/>
+      <stop offset="1" stop-color="#6b47f5"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <g fill="#ffffff">
+    <rect x="232" y="486" width="560" height="236" rx="118"/>
+    <circle cx="384" cy="508" r="122"/>
+    <circle cx="560" cy="440" r="172"/>
+    <circle cx="674" cy="590" r="118"/>
+  </g>
+  <g fill="none" stroke="url(#ink)" stroke-width="52" stroke-linecap="round" stroke-linejoin="round">
+    <polyline points="398,534 474,594 398,654"/>
+    <line x1="520" y1="654" x2="632" y2="654"/>
+  </g>
+</svg>

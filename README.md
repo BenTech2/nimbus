@@ -10,8 +10,10 @@ Runs natively on **macOS, Windows and Linux** (Tauri: Rust core + the OS's own w
 ## Features
 
 - **Hosts and groups**: card grid, or a compact list (the switch by the New Host
-  button; Nimbus remembers your choice). Colours, tags, notes, search.
-  Groups can set a default username, port and key for every host inside them.
+  button; Nimbus remembers your choice). Like the Passwords list, the group chips along the top
+  filter the list, and "All" shows a section per group. Colours, tags, notes, search.
+  Groups can set a default username, port and key for every host inside them (edit a group from
+  the pencil by its chip, or right-click a group).
 - **Serial consoles**: add a host of type Serial for a router or switch console cable, an Arduino
   or any USB-serial adapter. Pick the port (Scan lists what's plugged in), baud rate, data bits,
   parity, stop bits and flow control, what Enter sends (CR / LF / CR LF) and local echo. It opens
@@ -21,7 +23,9 @@ Runs natively on **macOS, Windows and Linux** (Tauri: Rust core + the OS's own w
   Start with `sftp://`, `ftp://` or `ftps://` to open the file browser instead.
 - **Light and dark themes**: follow the system, or pick one in Settings.
 - **Tabs**: many sessions at once. ⌘T home, ⌘W close tab, ⌘1–9 switch, ⌘D duplicate,
-  Ctrl+Tab cycle (on Windows and Linux use Ctrl+Shift instead of ⌘).
+  Ctrl+Tab cycle (on Windows and Linux use Ctrl+Shift instead of ⌘). Drag a tab along the tab
+  bar to reorder it, or pull it out of the bar to give it its own window, like Chrome; drop it on
+  another window's tab bar to put it back. The connection stays up and the scrollback comes along.
 - **Authentication**: saved key → SSH agent (ssh-agent, 1Password, Secretive, Pageant)
   → password / keyboard-interactive (2FA prompts work). Anything missing is asked for, with
   an option to save it.
@@ -59,8 +63,55 @@ Runs natively on **macOS, Windows and Linux** (Tauri: Rust core + the OS's own w
   trusted host keys / certificates. Exports are always encrypted with a password you choose
   (scrypt + AES-256-GCM over the whole file, so not even host names are readable), and that
   password is needed to import. A forgotten export password can't be recovered.
+- **AI agents (MCP)**: let Claude Code, Claude Desktop, Grok, Cursor or any MCP client run
+  commands on your hosts and call APIs with your saved credentials. Turn it on in
+  **Settings → AI agents**, then add one agent per app. See [AI agents](#ai-agents-mcp) below.
 - **Links** (password and API websites, links in the terminal with ⌘/Ctrl-click) open in your
   default browser; Nimbus never loads outside pages in its own window.
+
+## AI agents (MCP)
+
+Nimbus can act as an [MCP](https://modelcontextprotocol.io) server, so AI agents can work on your
+machines without ever being handed your passwords or keys. It's off until you turn it on.
+
+**Setting up:** Settings → AI agents → tick *Allow AI agents to connect*, then **+ Agent**. Nimbus
+shows the agent's token once, with ready-to-paste setup for:
+
+- **Claude Code**: `claude mcp add --transport http nimbus http://127.0.0.1:47821/mcp --header "Authorization: Bearer <token>"`
+- **Claude Desktop, Cursor and other apps that start a command**: the Nimbus app itself with
+  `--mcp` and the token in `NIMBUS_MCP_TOKEN` (a stdio bridge to the running app).
+- **Anything else** (Grok, scripts): Streamable HTTP at `http://127.0.0.1:47821/mcp` with an
+  `Authorization: Bearer <token>` header.
+
+Then choose what the agent can use: single hosts, passwords and API credentials, or whole groups
+(which include anything added to them later).
+
+**What an agent can do**
+
+| Tool | What it does |
+|---|---|
+| `list_hosts`, `list_credentials` | See what it's been granted: names, addresses, usernames, URLs. Never notes or secret values. |
+| `run_command` | Run a command on a granted SSH host and get the output. Nimbus logs in with the saved key or password. With `sudo`, Nimbus types the host's saved password at sudo's prompt. |
+| `http_request` | Call an API with a granted credential. Nimbus adds the API key, token, Basic auth or OAuth client-credentials token, only for the credential's own site, and scrubs the secret from the reply. |
+| `get_secret` | Only if you allow it for that agent: ask to see a secret value. You approve every single one. |
+
+**How it's kept safe**
+
+- Listens on 127.0.0.1 only, and refuses requests from web pages or other host names.
+- Each agent has its own random token; Nimbus stores only a hash of it. Pause an agent, make a new
+  token, or remove it at any time.
+- By default every command and API request waits for you to click **Allow** in Nimbus (the window
+  comes to the front). You can choose "Allow for 30 min" for one host or credential, or set an
+  agent to run without asking.
+- Agents can't change anything in Nimbus, can't trust a new host key, and can't answer login
+  prompts. Connect to a host once yourself first.
+- An API credential only works against its own base URL (no sending your key to another site,
+  no https → http, no following redirects).
+- Everything an agent does is in Settings → AI agents → Recent activity (also
+  `mcp-activity.log` in the data folder). Agent access is never included in exports.
+
+What it can't protect against: an agent you've set to "allow without asking" can run anything on
+the hosts you gave it, and once you approve `get_secret` the agent has that value.
 
 ## Where data is stored
 
@@ -69,7 +120,8 @@ Runs natively on **macOS, Windows and Linux** (Tauri: Rust core + the OS's own w
 | Folder | `~/Library/Application Support/app.nimbus.ssh` | `%APPDATA%\app.nimbus.ssh` | `~/.local/share/app.nimbus.ssh` |
 
 - `nimbus-data.json`: hosts, groups, public keys, snippets, password and API key names, known
-  hosts, settings (plain JSON, no secrets)
+  hosts, settings, AI agents and their access (plain JSON, no secrets; agent tokens only as hashes)
+- `mcp-activity.log`: what AI agents did (no secret values)
 - `secrets.bin`: passwords, private keys, passphrases and API secrets, encrypted with AES-256-GCM. The
   encryption key is held in the OS keychain (Keychain / Credential Manager / Secret Service).
   If no keychain is available, it falls back to a local `master.key` file and the app says so.
@@ -106,6 +158,10 @@ over, make it executable (right-click → Properties → Permissions, or `chmod 
 The AppImage carries its own copy of the web view, so nothing needs installing. To use a USB
 serial adapter on Linux, your user needs to be in the `dialout` group.
 
+Scripted UI checks: a debug build runs the JavaScript file in `NIMBUS_DEV_SCRIPT` in every
+window, and can report back with the `dev_log` command (printed to stderr). Use it with a throwaway
+`NIMBUS_DATA_DIR`.
+
 Backend tests (`src-tauri/src/tests.rs`). The FTP and FTPS tests start their own FTP server
 inside the test. The SSH and SFTP tests run against a real `sshd` on 127.0.0.1:2222 (with
 `Subsystem sftp internal-sftp`) when `NIMBUS_TEST_SSHD` points at a folder with the test keys
@@ -115,17 +171,21 @@ inside the test. The SSH and SFTP tests run against a real `sshd` on 127.0.0.1:2
 cd src-tauri && NIMBUS_TEST_SSHD=/path/to/keys cargo test
 ```
 
+The agent `sudo` test also needs a second sshd on 127.0.0.1:2223 whose `PATH` starts with a fake
+`sudo` that accepts `hunter2-sudo` (`SetEnv PATH=...` in its config); set `NIMBUS_TEST_SUDO=1`.
+
 ## Layout
 
 ```
 src/                 UI (vanilla JS + xterm.js)
   main.js            views, editors, tabs, shortcuts
-  terminal.js        one terminal tab ↔ one SSH session
+  terminal.js        one terminal tab ↔ one SSH session (tabs can move between windows)
   files.js           one file browser tab (local pane + SFTP/FTP pane, transfers)
   prompts.js         host-key / password / 2FA dialogs
 src-tauri/src/       Rust core
   ssh.rs             connect, host-key check, auth, jump hosts, PTY pump (russh)
   files.rs           local disk, SFTP and FTP/FTPS browsing and transfers
+  mcp.rs             AI agent (MCP) server, approvals, stdio bridge
   serial.rs          serial port sessions
 src/apikeys.js       API credential types and "Copy as" formats
 docker/, scripts/    the Linux ARM64 build

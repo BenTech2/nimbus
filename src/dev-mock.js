@@ -37,11 +37,22 @@ const data = {
     { id: 'ak4', name: 'OpenWeather', kind: 'apiKey', service: 'OpenWeather', environment: null, baseUrl: 'api.openweathermap.org/data/2.5', fields: [{ id: 'key', label: 'API key', secret: true }, { id: 'name', label: 'Header or parameter name', secret: false, value: 'appid' }, { id: 'in', label: 'Send it as', secret: false, value: 'query' }], expires: Date.now() - 86400000 * 2, updated: Date.now() - 86400000 * 60 },
   ],
   knownHosts: [{ host: '10.0.1.11:22', keyType: 'ssh-ed25519', fingerprint: 'SHA256:Zq1a8m0XqfTnS3tU2kq7Ff3n9m0Q5wqzY6Yk0dQ1abc', added: Date.now() - 86400000 * 3 }],
+  mcp: {
+    enabled: true, port: 47821,
+    agents: [{ id: 'ag-claude', name: 'Claude Code', tokenHash: 'x', tokenHint: 'Q9xf', created: Date.now() - 86400000 * 3, lastUsed: Date.now() - 600000, paused: false, hosts: [], hostGroups: [g2], passwords: ['pw2'], passwordGroups: [], apiKeys: ['ak2'], apiGroups: [], commands: 'ask', requests: 'allow', reveal: false }],
+  },
   settings: { theme: 'system', hostsView: 'grid', fontSize: 13, fontFamily: '"SF Mono", Menlo, Consolas, monospace', cursorStyle: 'block', cursorBlink: true, scrollback: 10000, copyOnSelect: false, keepaliveSecs: 30, typePasswordEnter: true, agentSocket: null },
 };
 const apiSecrets = { ak1: { token: 'sk_live_51Hx…REDACTED' }, ak2: { token: 'sk_test_51Hx9fake' }, ak3: { clientSecret: 'ghs_example_secret' }, ak4: { key: 'b6907d289e10d714a6e88b30761fae22' } };
 const secrets = { ak1: { fields: ['token'] }, ak2: { fields: ['token'] }, ak3: { fields: ['clientSecret'] }, ak4: { fields: ['key'] }, [k1]: { privateKey: true }, pw1: { password: true }, pw2: { password: true }, pw3: { password: true }, pw4: { password: true } };
 const plain = { pw1: 'correct-horse-battery', pw2: 'Rout3r!admin', pw3: 'gh-9fK2m!xQ', pw4: 'pve-Root#1' };
+
+const mcpLog = [
+  { time: Date.now() - 600000, agentId: 'ag-claude', agent: 'Claude Code', tool: 'run_command', target: 'Raspberry Pi (192.168.1.40)', detail: 'df -h /', outcome: 'ok', message: '' },
+  { time: Date.now() - 900000, agentId: 'ag-claude', agent: 'Claude Code', tool: 'http_request', target: 'Stripe test', detail: 'GET /v1/charges?limit=3', outcome: 'ok', message: '' },
+  { time: Date.now() - 3600000, agentId: 'ag-claude', agent: 'Claude Code', tool: 'run_command', target: 'NAS (192.168.1.10)', detail: 'rm -rf /volume1/old-backups', outcome: 'denied', message: 'The user declined this in Nimbus.' },
+  { time: Date.now() - 7200000, agentId: 'ag-claude', agent: 'Claude Code', tool: 'run_command', target: 'web-01', detail: 'uptime', outcome: 'refused', message: 'No host called “web-01” has been shared with you.' },
+];
 
 // ---------- fake file systems for the Files tab ----------
 const now = Date.now();
@@ -198,6 +209,15 @@ mockIPC(
       case 'ssh_resize': case 'ssh_close': return null;
       case 'ssh_break': sessions.get(a.sessionId)?.('\x03'); return null;
       case 'serial_ports': return [{ name: '/dev/cu.usbserial-A10K3', description: 'FT232R USB UART (FTDI)' }, { name: '/dev/cu.Bluetooth-Incoming-Port', description: 'Bluetooth' }];
+      case 'mcp_status': return { enabled: data.mcp.enabled, running: data.mcp.enabled, port: data.mcp.port, url: `http://127.0.0.1:${data.mcp.port}/mcp`, error: null, exe: '/Applications/Nimbus.app/Contents/MacOS/nimbus' };
+      case 'mcp_configure': data.mcp.enabled = a.enabled; data.mcp.port = a.port; return { enabled: a.enabled, running: a.enabled, port: a.port, url: `http://127.0.0.1:${a.port}/mcp`, error: null, exe: '/Applications/Nimbus.app/Contents/MacOS/nimbus' };
+      case 'mcp_create_agent': { const nid = id(); data.mcp.agents.push({ id: nid, name: a.name, tokenHash: 'x', tokenHint: 'k3Za', created: Date.now(), lastUsed: null, paused: false, hosts: [], hostGroups: [], passwords: [], passwordGroups: [], apiKeys: [], apiGroups: [], commands: 'ask', requests: 'ask', reveal: false }); return { id: nid, token: 'nimbus_mockTokenOnlyForTheBrowserPreview_k3Za', state: snap() }; }
+      case 'mcp_regenerate_token': return { id: a.id, token: 'nimbus_mockRegeneratedToken_W7pe', state: snap() };
+      case 'mcp_save_agent': upsert(data.mcp.agents, a.agent); return snap();
+      case 'mcp_delete_agent': data.mcp.agents = data.mcp.agents.filter((x) => x.id !== a.id); return snap();
+      case 'mcp_decide': console.info('[mock] decision', a.id, a.decision); return null;
+      case 'mcp_activity': return mcpLog;
+      case 'mcp_clear_activity': mcpLog.length = 0; return null;
       case 'prompt_reply': prompts.get(a.id)?.(a.value); prompts.delete(a.id); return null;
       case 'plugin:clipboard-manager|write_text': return null;
       default: console.warn('[mock] unhandled', cmd, a); return null;

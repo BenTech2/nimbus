@@ -63,8 +63,8 @@ async fn session(
     });
 
     let (tx, rx) = mpsc::unbounded_channel();
-    let ctx = Ctx { store, prompts, events };
-    let task = tokio::spawn(ssh::run_session(ctx, host_id.to_string(), 120, 30, data, rx));
+    let ctx = Ctx { store, prompts, events: events.into() };
+    let task = tokio::spawn(ssh::run_session(ctx, host_id.to_string(), 120, 30, data.into(), rx));
 
     // Wait until connected (or finished), then type.
     for _ in 0..100 {
@@ -332,6 +332,7 @@ fn seed_demo() {
         let host = s.data.hosts.iter_mut().find(|x| x.id == h).unwrap();
         host.label = "Local test server".into();
         host.tags = vec!["test".into()];
+        trust_test_host(&mut s, &sshd_dir().unwrap(), 2222);
     }
     let g = |s: &mut Store, name: &str, color: &str, user: &str| {
         let id = new_id();
@@ -407,7 +408,7 @@ fn auto_ctx(store: Arc<Mutex<Store>>, answers: Vec<Value>) -> (Ctx, Arc<Mutex<Ve
         }
         Ok(())
     });
-    (Ctx { store, prompts, events }, log)
+    (Ctx { store, prompts, events: events.into() }, log)
 }
 
 /// Start a transfer and wait for its final event.
@@ -710,7 +711,7 @@ async fn serial_session(
         Ok(())
     });
     let (tx, rx) = mpsc::unbounded_channel();
-    let task = tokio::spawn(crate::serial::run_serial(ctx, id, data, rx));
+    let task = tokio::spawn(crate::serial::run_serial(ctx, id, data.into(), rx));
     for _ in 0..50 {
         if log.lock().unwrap().iter().any(|e| e["state"] == "connected" || e["state"] == "error") {
             break;
@@ -789,7 +790,7 @@ async fn serial_missing_port_explains_itself() {
     s.data.hosts.push(Host { id: id.clone(), label: "gone".into(), protocol: "serial".into(), address: "/dev/cu.nimbus-does-not-exist".into(), ..Default::default() });
     let (ctx, log) = auto_ctx(Arc::new(Mutex::new(s)), vec![]);
     let (_tx, rx) = mpsc::unbounded_channel();
-    crate::serial::run_serial(ctx, id, Channel::new(|_| Ok(())), rx).await;
+    crate::serial::run_serial(ctx, id, Channel::new(|_| Ok(())).into(), rx).await;
     let last = log.lock().unwrap().last().cloned().unwrap();
     assert_eq!(last["state"], "error");
     let msg = last["message"].as_str().unwrap();
@@ -894,4 +895,455 @@ fn only_nimbus_pages_load_in_the_window() {
     assert!(!ok("http://192.168.1.1/"));
     assert!(!ok("https://localhost.evil.com/"));
     assert!(!ok("file:///etc/passwd"));
+}
+
+// ---------- AI agents (MCP) ----------
+
+use crate::mcp::{self, Decision, Hub, HubEvent};
+use crate::store::{ApiCredential, ApiField, Group, McpAgent, PasswordEntry};
+
+/// A store with one agent; returns (store, hub, events, token, agent id).
+fn mcp_setup(name: &str, timeout: Duration, f: impl FnOnce(&mut Store, &mut McpAgent)) -> (Arc<Mutex<Store>>, Arc<Hub>, mpsc::UnboundedReceiver<HubEvent>, String, String) {
+    let mut s = Store::open(temp_dir(name)).unwrap();
+    let token = mcp::new_token();
+    let mut agent = McpAgent {
+        id: new_id(),
+        name: "Test agent".into(),
+        token_hash: mcp::token_hash(&token),
+        token_hint: mcp::token_hint(&token),
+        commands: "ask".into(),
+        requests: "ask".into(),
+        ..Default::default()
+    };
+    f(&mut s, &mut agent);
+    let id = agent.id.clone();
+    s.data.mcp.agents.push(agent);
+    let store = Arc::new(Mutex::new(s));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let hub = Arc::new(Hub::for_tests(store.clone(), tx, timeout));
+    (store, hub, rx, token, id)
+}
+
+async fn tool(hub: &Hub, agent: &str, name: &str, args: Value) -> (bool, String) {
+    let r = hub.rpc(agent, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": name, "arguments": args } })).await.unwrap();
+    let res = &r["result"];
+    assert!(r.get("error").is_none(), "rpc error: {r}");
+    (res["isError"].as_bool().unwrap(), res["content"][0]["text"].as_str().unwrap().to_string())
+}
+
+/// Answer approval requests in order with `decisions`; returns every approval request seen.
+fn approver(hub: Arc<Hub>, mut rx: mpsc::UnboundedReceiver<HubEvent>, decisions: Vec<Option<Decision>>) -> Arc<Mutex<Vec<Value>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen2 = seen.clone();
+    tokio::spawn(async move {
+        let mut decisions = VecDeque::from(decisions);
+        while let Some(ev) = rx.recv().await {
+            if let HubEvent::Approval(v) = ev {
+                seen2.lock().unwrap().push(v.clone());
+                if let Some(Some(d)) = decisions.pop_front() {
+                    hub.decide(v["id"].as_str().unwrap(), d);
+                }
+            }
+        }
+    });
+    seen
+}
+
+#[test]
+fn mcp_tokens_and_sites() {
+    let t = mcp::new_token();
+    assert!(t.starts_with("nimbus_") && t.len() > 40);
+    assert_ne!(t, mcp::new_token());
+    assert_eq!(mcp::token_hash(&t).len(), 64);
+    assert_eq!(mcp::token_hint(&t), t[t.len() - 4..]);
+
+    let base = mcp::parse_site("api.example.com").unwrap();
+    assert_eq!(base.as_str(), "https://api.example.com/");
+    let ok = |u: &str| mcp::same_site(&base, &reqwest::Url::parse(u).unwrap());
+    assert!(ok("https://api.example.com/v1/x?y=1"));
+    assert!(ok("https://API.example.com:443/"));
+    assert!(!ok("http://api.example.com/"), "no downgrade to http");
+    assert!(!ok("https://api.example.com.evil.com/"));
+    assert!(!ok("https://evil.com/?api.example.com"));
+    assert!(!ok("https://api.example.com:8443/"));
+    assert!(!ok("https://user@evil.com/"));
+    let local = mcp::parse_site("http://192.168.1.1").unwrap();
+    assert!(mcp::same_site(&local, &reqwest::Url::parse("http://192.168.1.1/cgi").unwrap()));
+}
+
+#[tokio::test]
+async fn mcp_agent_sees_only_what_it_was_granted() {
+    let (store, hub, _rx, _t, agent) = mcp_setup("mcp-scope", Duration::from_secs(5), |s, a| {
+        let g = Group { id: new_id(), name: "Prod".into(), ..Default::default() };
+        let mk = |label: &str, protocol: &str, group: Option<String>| Host { id: new_id(), label: label.into(), protocol: protocol.into(), address: format!("{label}.example"), group_id: group, notes: Some("root pw is NOTESECRET".into()), ..Default::default() };
+        let (granted, in_group, other, ftp) = (mk("granted", "ssh", None), mk("ingroup", "ssh", Some(g.id.clone())), mk("other", "ssh", None), mk("ftpbox", "ftp", Some(g.id.clone())));
+        a.hosts.push(granted.id.clone());
+        a.host_groups.push(g.id.clone());
+        s.update_secret(&granted.id, |x| x.password = Some("HOSTPASSWORD".into()));
+        s.data.groups.push(g);
+        s.data.hosts.extend([granted, in_group, other, ftp]);
+
+        let pw = PasswordEntry { id: new_id(), name: "Router".into(), username: Some("admin".into()), url: Some("192.168.1.1".into()), ..Default::default() };
+        let hidden = PasswordEntry { id: new_id(), name: "Bank".into(), ..Default::default() };
+        s.update_secret(&pw.id, |x| x.password = Some("ROUTERPASSWORD".into()));
+        s.update_secret(&hidden.id, |x| x.password = Some("BANKPASSWORD".into()));
+        a.passwords.push(pw.id.clone());
+        s.data.passwords.extend([pw, hidden]);
+        let api = ApiCredential {
+            id: new_id(),
+            name: "GitHub".into(),
+            kind: "bearer".into(),
+            fields: vec![ApiField { id: "token".into(), label: "Token".into(), secret: true, value: None }],
+            ..Default::default()
+        };
+        s.update_secret(&api.id, |x| { x.fields.insert("token".into(), "GHTOKEN123".into()); });
+        a.api_keys.push(api.id.clone());
+        s.data.api_keys.push(api);
+    });
+
+    let init = hub.rpc(&agent, json!({ "jsonrpc": "2.0", "id": 0, "method": "initialize", "params": { "protocolVersion": "2025-06-18" } })).await.unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+    assert!(hub.rpc(&agent, json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).await.is_none());
+    let tools = hub.rpc(&agent, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" })).await.unwrap();
+    let names: Vec<&str> = tools["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["list_hosts", "run_command", "list_credentials", "http_request"], "no get_secret without permission");
+
+    let (err, hosts) = tool(&hub, &agent, "list_hosts", json!({})).await;
+    assert!(!err);
+    assert!(hosts.contains("granted") && hosts.contains("ingroup"), "{hosts}");
+    assert!(!hosts.contains("other.example") && !hosts.contains("ftpbox"), "{hosts}");
+    assert!(!hosts.contains("NOTESECRET") && !hosts.contains("HOSTPASSWORD"));
+
+    let (_, creds) = tool(&hub, &agent, "list_credentials", json!({})).await;
+    assert!(creds.contains("Router") && creds.contains("GitHub"));
+    assert!(!creds.contains("Bank"));
+    for secret in ["ROUTERPASSWORD", "GHTOKEN123", "BANKPASSWORD"] {
+        assert!(!creds.contains(secret), "{secret} leaked: {creds}");
+    }
+
+    let (err, msg) = tool(&hub, &agent, "run_command", json!({ "host": "other", "command": "id" })).await;
+    assert!(err && msg.contains("No host called"), "{msg}");
+    let (err, msg) = tool(&hub, &agent, "http_request", json!({ "credential": "Bank", "url": "/" })).await;
+    assert!(err && msg.contains("No credential called"), "{msg}");
+    let (err, msg) = tool(&hub, &agent, "get_secret", json!({ "credential": "Router", "reason": "x" })).await;
+    assert!(err && msg.contains("isn't allowed to see secrets"), "{msg}");
+    let unknown = hub.rpc(&agent, json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": { "name": "export_everything" } })).await.unwrap();
+    assert!(unknown.get("error").is_some());
+
+    let log = hub.activity();
+    assert_eq!(log.len(), 3);
+    assert!(log.iter().all(|a| a.outcome == "refused"), "{log:?}");
+
+    // Paused and removed agents are turned away.
+    store.lock().unwrap().data.mcp.agents[0].paused = true;
+    let r = hub.rpc(&agent, json!({ "jsonrpc": "2.0", "id": 3, "method": "tools/list" })).await.unwrap();
+    assert!(r["error"]["message"].as_str().unwrap().contains("paused"));
+    store.lock().unwrap().data.mcp.agents.clear();
+    let r = hub.rpc(&agent, json!({ "jsonrpc": "2.0", "id": 4, "method": "tools/list" })).await.unwrap();
+    assert!(r["error"]["message"].as_str().unwrap().contains("removed"));
+}
+
+#[tokio::test]
+async fn mcp_secrets_need_permission_and_approval_every_time() {
+    let (_store, hub, rx, _t, agent) = mcp_setup("mcp-reveal", Duration::from_secs(1), |s, a| {
+        a.reveal = true;
+        let pw = PasswordEntry { id: new_id(), name: "Router".into(), ..Default::default() };
+        s.update_secret(&pw.id, |x| x.password = Some("ROUTERPASSWORD".into()));
+        a.passwords.push(pw.id.clone());
+        s.data.passwords.push(pw);
+    });
+    // Deny, then "remember" (which must not stick for secrets), then approve once, then no answer.
+    let seen = approver(hub.clone(), rx, vec![Some(Decision::Deny), Some(Decision::Remember), Some(Decision::Once), None]);
+    let args = json!({ "credential": "Router", "reason": "log in to the router UI" });
+    let (err, msg) = tool(&hub, &agent, "get_secret", args.clone()).await;
+    assert!(err && msg.contains("declined"), "{msg}");
+    let (err, msg) = tool(&hub, &agent, "get_secret", args.clone()).await;
+    assert!(!err && msg == "ROUTERPASSWORD");
+    let (err, msg) = tool(&hub, &agent, "get_secret", args.clone()).await;
+    assert!(!err && msg == "ROUTERPASSWORD");
+    let (err, msg) = tool(&hub, &agent, "get_secret", args).await;
+    assert!(err && msg.contains("within 2 minutes"), "{msg}");
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 4, "every reveal asks");
+    assert_eq!(seen[0]["remember"], false);
+    assert_eq!(seen[0]["kind"], "reveal");
+    assert!(seen[0]["body"].as_str().unwrap().contains("router UI"));
+    let outcomes: Vec<String> = hub.activity().iter().rev().map(|a| a.outcome.clone()).collect();
+    assert_eq!(outcomes, ["denied", "ok", "ok", "denied"]);
+    assert!(hub.activity().iter().all(|a| !a.detail.contains("ROUTERPASSWORD") && !a.message.contains("ROUTERPASSWORD")));
+}
+
+/// A tiny HTTP server that echoes the request line and headers back in the body.
+async fn echo_server() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                let svc = hyper::service::service_fn(|req: hyper::Request<hyper::body::Incoming>| async move {
+                    use http_body_util::BodyExt;
+                    let mut text = format!("{} {}\n", req.method(), req.uri());
+                    for (k, v) in req.headers() {
+                        text.push_str(&format!("{k}: {}\n", v.to_str().unwrap_or("")));
+                    }
+                    let body = req.into_body().collect().await.unwrap().to_bytes();
+                    text.push_str(&format!("\n{}", String::from_utf8_lossy(&body)));
+                    let mut r = hyper::Response::new(http_body_util::Full::new(hyper::body::Bytes::from(text)));
+                    r.headers_mut().insert("x-echo", "GHTOKEN123".parse().unwrap());
+                    Ok::<_, std::convert::Infallible>(r)
+                });
+                let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), svc).await;
+            });
+        }
+    });
+    port
+}
+
+#[tokio::test]
+async fn mcp_http_request_adds_the_secret_only_for_its_own_site() {
+    let port = echo_server().await;
+    let base = format!("http://127.0.0.1:{port}");
+    let b2 = base.clone();
+    let (_store, hub, rx, _t, agent) = mcp_setup("mcp-http", Duration::from_secs(5), move |s, a| {
+        a.requests = "allow".into();
+        let api = |name: &str, kind: &str, fields: Vec<ApiField>| ApiCredential { id: new_id(), name: name.into(), kind: kind.into(), base_url: Some(b2.clone()), fields, ..Default::default() };
+        let secret = |id: &str| ApiField { id: id.into(), label: id.into(), secret: true, value: None };
+        let plain = |id: &str, v: &str| ApiField { id: id.into(), label: id.into(), secret: false, value: Some(v.into()) };
+        let bearer = api("GitHub", "bearer", vec![secret("token")]);
+        let query = api("Maps", "apiKey", vec![secret("key"), plain("name", "api_key"), plain("in", "query")]);
+        let custom = ApiCredential { fields: vec![ApiField { id: "c1".into(), label: "Signing key".into(), secret: true, value: None }], ..api("Custom", "custom", vec![]) };
+        let nourl = ApiCredential { base_url: None, ..api("NoUrl", "bearer", vec![secret("token")]) };
+        s.update_secret(&bearer.id, |x| { x.fields.insert("token".into(), "GHTOKEN123".into()); });
+        s.update_secret(&query.id, |x| { x.fields.insert("key".into(), "MAPSKEY456".into()); });
+        s.update_secret(&custom.id, |x| { x.fields.insert("c1".into(), "SIGNKEY789".into()); });
+        s.update_secret(&nourl.id, |x| { x.fields.insert("token".into(), "NOURLTOKEN".into()); });
+        let pw = PasswordEntry { id: new_id(), name: "Router".into(), username: Some("admin".into()), url: Some(b2.clone()), ..Default::default() };
+        s.update_secret(&pw.id, |x| x.password = Some("ROUTERPASSWORD".into()));
+        for id in [&bearer.id, &query.id, &custom.id, &nourl.id] {
+            a.api_keys.push(id.clone());
+        }
+        a.passwords.push(pw.id.clone());
+        s.data.api_keys.extend([bearer, query, custom, nourl]);
+        s.data.passwords.push(pw);
+    });
+    let seen = approver(hub.clone(), rx, vec![]);
+
+    // Bearer: header added, and the token scrubbed from the echoed headers and body.
+    let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "GitHub", "url": "/v1/user?x=1" })).await;
+    assert!(!err, "{out}");
+    assert!(out.starts_with("HTTP 200"), "{out}");
+    assert!(out.contains("GET /v1/user?x=1"));
+    assert!(out.contains("authorization: Bearer [redacted by Nimbus]"), "{out}");
+    assert!(out.contains("x-echo: [redacted by Nimbus]"));
+    assert!(!out.contains("GHTOKEN123"));
+
+    // API key in the query string; POST body passes through.
+    let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "Maps", "method": "post", "url": format!("{base}/geo"), "body": "{\"q\":1}", "headers": { "Content-Type": "application/json" } })).await;
+    assert!(!err && out.contains("POST /geo?api_key=[redacted by Nimbus]") && out.contains("{\"q\":1}"), "{out}");
+    assert!(!out.contains("MAPSKEY456"));
+
+    // Custom fields placed by the agent; password entries use Basic auth.
+    let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "Custom", "url": "/sign", "headers": { "X-Sig": "k={{Signing key}}" } })).await;
+    assert!(!err && out.contains("x-sig: k=[redacted by Nimbus]") && !out.contains("SIGNKEY789"), "{out}");
+    let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "Router", "url": "/" })).await;
+    assert!(!err && out.contains("authorization: Basic [redacted by Nimbus]"), "{out}");
+    let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "Custom", "url": "/", "headers": { "X": "{{nope}}" } })).await;
+    assert!(err && out.contains("no saved value"), "{out}");
+
+    // Anywhere else is refused before anything is sent, including tricks with placeholders.
+    for url in [
+        "http://127.0.0.2:1/steal".to_string(),
+        format!("http://localhost:{port}/"),
+        format!("http://127.0.0.1:{}/", port.wrapping_add(1)),
+        "https://evil.example/?{{token}}".to_string(),
+        format!("http://{{{{token}}}}.evil.example:{port}/"),
+    ] {
+        let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "GitHub", "url": url })).await;
+        assert!(err && (out.contains("may only be used with") || out.contains("isn't a valid URL")), "{url}: {out}");
+        assert!(!out.contains("GHTOKEN123"));
+    }
+    let (err, out) = tool(&hub, &agent, "http_request", json!({ "credential": "NoUrl", "url": "https://api.github.com/" })).await;
+    assert!(err && out.contains("no website / base URL"), "{out}");
+    assert!(seen.lock().unwrap().is_empty(), "requests were set to allow");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_server_refuses_strangers_and_bridge_relays() {
+    let (_store, hub, _rx, token, _agent) = mcp_setup("mcp-http-server", Duration::from_secs(5), |_, _| {});
+    let server = mcp::start(hub.clone(), 0).await.unwrap();
+    let port = server.port;
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let client = mcp::build_http_client().unwrap();
+    let init = json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": { "protocolVersion": "2025-03-26" } }).to_string();
+    let send = |auth: Option<&str>, host: Option<&str>, origin: Option<&str>| {
+        let mut r = client.post(&url).header("content-type", "application/json").body(init.clone());
+        if let Some(a) = auth { r = r.header("authorization", format!("Bearer {a}")); }
+        if let Some(h) = host { r = r.header("host", h); }
+        if let Some(o) = origin { r = r.header("origin", o); }
+        r.send()
+    };
+    assert_eq!(send(None, None, None).await.unwrap().status(), 401);
+    assert_eq!(send(Some("nimbus_wrong"), None, None).await.unwrap().status(), 401);
+    assert_eq!(send(Some(&token), Some(&format!("evil.example:{port}")), None).await.unwrap().status(), 403, "DNS rebinding");
+    assert_eq!(send(Some(&token), None, Some("https://evil.example")).await.unwrap().status(), 403, "web pages");
+    let ok = send(Some(&token), None, None).await.unwrap();
+    assert_eq!(ok.status(), 200);
+    let v: Value = serde_json::from_slice(&ok.bytes().await.unwrap()).unwrap();
+    assert_eq!(v["result"]["serverInfo"]["name"], "nimbus");
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 405, "only POST carries MCP messages");
+
+    // stdio bridge: requests in, one reply line per request out; notifications get none.
+    let input = format!(
+        "{}\n{}\n\n{}\n",
+        json!({ "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {} }),
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list" }),
+    );
+    let mut out = Vec::new();
+    mcp::bridge(port, token.clone(), tokio::io::BufReader::new(input.as_bytes()), &mut out).await.unwrap();
+    let lines: Vec<Value> = String::from_utf8(out).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 2);
+    let mut ids: Vec<i64> = lines.iter().map(|l| l["id"].as_i64().unwrap()).collect();
+    ids.sort();
+    assert_eq!(ids, [1, 2]);
+
+    let mut out = Vec::new();
+    mcp::bridge(port, "nimbus_wrong".into(), tokio::io::BufReader::new(input.as_bytes()), &mut out).await.unwrap();
+    assert!(String::from_utf8_lossy(&out).contains("didn't accept this agent's token"));
+
+    // Turned off: the bridge says so instead of hanging.
+    server.stop();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut out = Vec::new();
+    mcp::bridge(port, token, tokio::io::BufReader::new(input.as_bytes()), &mut out).await.unwrap();
+    assert!(String::from_utf8_lossy(&out).contains("isn't running"));
+}
+
+/// The test sshd's host key, trusted as if the user had accepted it.
+fn trust_test_host(s: &mut Store, dir: &std::path::Path, port: u16) {
+    let hostkey = dir.parent().map(|_| dir.join("../hostkey.pub")).unwrap();
+    let text = std::fs::read_to_string(&hostkey).or_else(|_| std::fs::read_to_string(dir.join("hostkey.pub"))).unwrap();
+    let pk = russh::keys::PublicKey::from_openssh(text.trim()).unwrap();
+    s.set_known_host(crate::store::KnownHost {
+        host: format!("127.0.0.1:{port}"),
+        key_type: pk.algorithm().as_str().into(),
+        fingerprint: pk.fingerprint(russh::keys::HashAlg::Sha256).to_string(),
+        added: 0,
+    });
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_run_command_waits_for_approval_and_never_trusts_keys() {
+    let Some(dir) = sshd_dir() else { return };
+    let (store, hub, rx, _t, agent) = mcp_setup("mcp-exec", Duration::from_secs(1), |s, a| {
+        let key = add_key(s, dir.join("client"), None);
+        let h = add_host(s, Some(key), None);
+        a.hosts.push(h);
+    });
+    let seen = approver(hub.clone(), rx, vec![Some(Decision::Deny), Some(Decision::Remember)]);
+    let run = |cmd: &str| tool(&hub, &agent, "run_command", json!({ "host": "local", "command": cmd }));
+
+    // Not trusted yet: refused before any approval, and the key is not added.
+    store.lock().unwrap().data.mcp.agents[0].commands = "allow".into();
+    let (err, msg) = run("echo hi").await;
+    assert!(err && msg.contains("host key"), "{msg}");
+    assert!(store.lock().unwrap().data.known_hosts.is_empty());
+
+    trust_test_host(&mut store.lock().unwrap(), &dir, 2222);
+    store.lock().unwrap().data.mcp.agents[0].commands = "ask".into();
+    let (err, msg) = run("echo hi").await;
+    assert!(err && msg.contains("declined"), "{msg}");
+    let (err, out) = run("echo out; echo err >&2; exit 3").await;
+    assert!(!err, "{out}");
+    assert!(out.starts_with("Exit code 3") && out.contains("--- stdout ---\nout") && out.contains("--- stderr ---\nerr"), "{out}");
+    // "Allow for 30 minutes" covers the next command on this host without asking.
+    let (err, out) = run("printf 'a\\nb'").await;
+    assert!(!err && out.contains("a\nb"), "{out}");
+    assert_eq!(seen.lock().unwrap().len(), 2);
+    assert_eq!(seen.lock().unwrap()[0]["body"], "echo hi");
+
+    // Timeouts stop the command.
+    let (err, out) = tool(&hub, &agent, "run_command", json!({ "host": "local", "command": "sleep 30", "timeout_seconds": 1 })).await;
+    assert!(!err && out.starts_with("Timed out"), "{out}");
+
+    // Changing the agent's access forgets "allow for 30 minutes".
+    hub.forget_agent(&agent);
+    let (err, msg) = run("echo again").await;
+    assert!(err && msg.contains("within 2 minutes"), "{msg}");
+
+    // sudo needs a saved password.
+    store.lock().unwrap().data.mcp.agents[0].commands = "allow".into();
+    let (err, msg) = tool(&hub, &agent, "run_command", json!({ "host": "local", "command": "id", "sudo": true })).await;
+    assert!(err && msg.contains("No password is saved"), "{msg}");
+}
+
+/// Needs a second test sshd on 127.0.0.1:2223 whose PATH starts with a fake `sudo` that
+/// accepts the password "hunter2-sudo" (NIMBUS_TEST_SUDO=1).
+#[tokio::test(flavor = "multi_thread")]
+async fn mcp_sudo_is_answered_by_nimbus() {
+    let Some(dir) = sshd_dir() else { return };
+    if std::env::var_os("NIMBUS_TEST_SUDO").is_none() {
+        return;
+    }
+    let mut host_id = String::new();
+    let (store, hub, _rx, _t, agent) = mcp_setup("mcp-sudo", Duration::from_secs(1), |s, a| {
+        a.commands = "allow".into();
+        let key = add_key(s, dir.join("client"), None);
+        host_id = add_host(s, Some(key), None);
+        s.data.hosts[0].port = Some(2223);
+        s.update_secret(&host_id, |x| x.password = Some("hunter2-sudo".into()));
+        trust_test_host(s, &dir, 2223);
+        a.hosts.push(host_id.clone());
+    });
+    let (err, out) = tool(&hub, &agent, "run_command", json!({ "host": "local", "command": "echo ok=$SUDO_OK; echo pw=hunter2-sudo", "sudo": true })).await;
+    assert!(!err, "{out}");
+    assert!(out.starts_with("Exit code 0") && out.contains("ok=1"), "{out}");
+    assert!(!out.contains("nimbus-sudo-"), "prompt marker removed: {out}");
+    assert!(out.contains("pw=[redacted by Nimbus]") && !out.contains("hunter2-sudo"), "{out}");
+
+    store.lock().unwrap().update_secret(&host_id, |x| x.password = Some("wrong-password".into()));
+    let (err, out) = tool(&hub, &agent, "run_command", json!({ "host": "local", "command": "echo ok=$SUDO_OK", "sudo": true, "timeout_seconds": 10 })).await;
+    assert!(!err && out.contains("sudo didn't accept") && !out.contains("ok=1"), "{out}");
+}
+
+#[test]
+fn agent_access_is_never_exported() {
+    let dir = temp_dir("mcp-export");
+    let mut s = Store::open(dir.clone()).unwrap();
+    s.data.mcp.enabled = true;
+    s.data.mcp.agents.push(McpAgent { id: "a".into(), name: "Claude".into(), token_hash: "h".into(), ..Default::default() });
+    let path = dir.join("x.nimbus");
+    crate::transfer::export(&s, &path, "long enough password").unwrap();
+    let mut other = Store::open(temp_dir("mcp-export-2")).unwrap();
+    crate::transfer::apply(&mut other, &path, "replace", "long enough password").unwrap();
+    assert!(other.data.mcp.agents.is_empty() && !other.data.mcp.enabled);
+    // Replacing the library keeps this computer's agents.
+    crate::transfer::apply(&mut s, &path, "replace", "long enough password").unwrap();
+    assert_eq!(s.data.mcp.agents.len(), 1);
+}
+
+#[test]
+fn moving_a_tab_holds_output_then_delivers_it_in_order() {
+    let first = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let second = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let sink = |buf: Arc<Mutex<Vec<u8>>>| {
+        Channel::new(move |body| {
+            if let InvokeResponseBody::Raw(b) = body {
+                buf.lock().unwrap().extend_from_slice(&b);
+            }
+            Ok(())
+        })
+    };
+    let relay: ssh::Relay<InvokeResponseBody> = sink(first.clone()).into();
+    let send = |s: &str| relay.send(InvokeResponseBody::Raw(s.as_bytes().to_vec())).unwrap();
+    send("one ");
+    relay.hold();
+    send("two ");
+    send("three ");
+    relay.hold(); // a second hold keeps what's held
+    relay.attach(sink(second.clone()));
+    send("four");
+    assert_eq!(String::from_utf8(first.lock().unwrap().clone()).unwrap(), "one ");
+    assert_eq!(String::from_utf8(second.lock().unwrap().clone()).unwrap(), "two three four");
 }

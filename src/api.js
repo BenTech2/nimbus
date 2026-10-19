@@ -33,6 +33,33 @@ export const api = {
   deleteApiGroup: (id) => invoke('delete_api_group', { id }),
   deletePasswordGroup: (id) => invoke('delete_password_group', { id }),
 
+  // AI agents (MCP server)
+  mcpStatus: () => invoke('mcp_status'),
+  mcpConfigure: (enabled, port) => invoke('mcp_configure', { enabled, port }),
+  mcpCreateAgent: (name) => invoke('mcp_create_agent', { name }),
+  mcpRegenerateToken: (id) => invoke('mcp_regenerate_token', { id }),
+  mcpSaveAgent: (agent) => invoke('mcp_save_agent', { agent }),
+  mcpDeleteAgent: (id) => invoke('mcp_delete_agent', { id }),
+  mcpDecide: (id, decision) => invoke('mcp_decide', { id, decision }),
+  mcpActivity: () => invoke('mcp_activity'),
+  mcpClearActivity: () => invoke('mcp_clear_activity'),
+
+  // Tabs moving between windows.
+  tabHandoff: (sessionId, payload, target, x, y, width, height) => invoke('tab_handoff', { sessionId, payload, target, x, y, width, height }),
+  tabClaim: (sessionId) => invoke('tab_claim', { sessionId }),
+  tabAttach(sessionId, onEvent, onData = () => {}) {
+    const events = new Channel();
+    events.onmessage = onEvent;
+    const data = new Channel();
+    data.onmessage = onData;
+    return invoke('tab_attach', { sessionId, events, data });
+  },
+  tabMove: (sessionId, target) => invoke('tab_move', { sessionId, target }),
+  tabWindowMove: (label, x, y) => invoke('tab_window_move', { label, x, y }),
+  tabDragOver: (exclude, x, y, done) => invoke('tab_drag_over', { exclude, x, y, done }),
+  closeTabWindow: () => invoke('close_tab_window'),
+  focusWindow: (label) => invoke('focus_window', { label }),
+
   // Files tab. sessionId "local" is this computer.
   fsOpen(sessionId, hostId, onEvent) {
     const events = new Channel();

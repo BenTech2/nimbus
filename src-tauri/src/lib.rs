@@ -1,5 +1,6 @@
 mod files;
 mod keys;
+mod mcp;
 mod serial;
 mod ssh;
 mod sshconfig;
@@ -19,8 +20,8 @@ use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{Manager, State};
 use tokio::sync::mpsc;
 
-use ssh::{Ctx, Input, Prompts, Session};
-use store::{new_id, now_ms, upsert, ApiCredential, Data, Group, Host, Key, PasswordEntry, PasswordGroup, SecretFlags, Settings, Snippet, Store};
+use ssh::{Ctx, Input, Prompts, Relay, Session};
+use store::{new_id, now_ms, upsert, ApiCredential, Data, Group, Host, Key, McpAgent, PasswordEntry, PasswordGroup, SecretFlags, Settings, Snippet, Store};
 
 /// A Files tab's connection: still connecting (so closing the tab can stop it), or ready.
 enum FsSlot {
@@ -28,16 +29,40 @@ enum FsSlot {
     Ready(Arc<files::Remote>),
 }
 
+struct FsTab {
+    slot: FsSlot,
+    events: Relay<Value>,
+    /// The window showing this tab.
+    window: String,
+}
+
+/// Where a terminal or Files tab is shown, and how to re-route it to another window.
+struct TabRoute {
+    window: String,
+    events: Relay<Value>,
+    /// Terminal output (Files tabs have only events).
+    data: Option<Relay<InvokeResponseBody>>,
+}
+
 struct AppState {
     store: Arc<Mutex<Store>>,
     sessions: Mutex<HashMap<String, Session>>,
-    files: Arc<Mutex<HashMap<String, FsSlot>>>,
+    files: Arc<Mutex<HashMap<String, FsTab>>>,
+    /// Terminal tabs' routes, by session id.
+    routes: Mutex<HashMap<String, TabRoute>>,
+    /// Tabs on their way to another window: what that window needs to show them.
+    handoffs: Mutex<HashMap<String, Value>>,
     prompts: Arc<Prompts>,
+    mcp: Arc<mcp::Hub>,
+    /// The running MCP server, and why it isn't running when it should be.
+    mcp_server: tokio::sync::Mutex<(Option<mcp::Server>, Option<String>)>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Snapshot {
+    /// Goes up with every saved change, so windows can tell when they're out of date.
+    rev: u64,
     data: Data,
     secrets: HashMap<String, SecretFlags>,
     vault_mode: String,
@@ -55,6 +80,7 @@ fn err(e: impl std::fmt::Display) -> String {
 
 fn snapshot(s: &Store) -> Snapshot {
     Snapshot {
+        rev: REV.load(std::sync::atomic::Ordering::SeqCst),
         data: s.data.clone(),
         secrets: s.secret_flags(),
         vault_mode: s.vault_mode().into(),
@@ -65,11 +91,24 @@ fn snapshot(s: &Store) -> Snapshot {
     }
 }
 
+static REV: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+/// Saved data changed: tell every window, so tab windows and the main window stay in step.
+pub(crate) fn state_changed() {
+    let rev = REV.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if let Some(app) = APP.get() {
+        use tauri::Emitter;
+        let _ = app.emit("state-changed", rev);
+    }
+}
+
 /// Run a mutation, save, and hand the UI the new state.
 fn mutate(state: &State<AppState>, f: impl FnOnce(&mut Store) -> anyhow::Result<()>) -> CmdResult<Snapshot> {
     let mut s = state.store.lock().unwrap();
     f(&mut s).map_err(|e| format!("{e:#}"))?;
     s.save().map_err(|e| format!("Could not save: {e:#}"))?;
+    state_changed();
     Ok(snapshot(&s))
 }
 
@@ -559,6 +598,7 @@ fn import_ssh_config(state: State<AppState>) -> CmdResult<SshConfigResult> {
 #[tauri::command]
 fn ssh_connect(
     state: State<AppState>,
+    window: tauri::Window,
     session_id: String,
     host_id: String,
     cols: u32,
@@ -568,6 +608,11 @@ fn ssh_connect(
 ) -> CmdResult<()> {
     let (tx, rx) = mpsc::unbounded_channel();
     let serial = state.store.lock().unwrap().host(&host_id).is_some_and(|h| h.is_serial());
+    let (events, data): (Relay<Value>, Relay<InvokeResponseBody>) = (events.into(), data.into());
+    state.routes.lock().unwrap().insert(
+        session_id.clone(),
+        TabRoute { window: window.label().to_string(), events: events.clone(), data: Some(data.clone()) },
+    );
     let ctx = Ctx { store: state.store.clone(), prompts: state.prompts.clone(), events };
     let task = if serial {
         tauri::async_runtime::spawn(serial::run_serial(ctx, host_id, data, rx))
@@ -609,7 +654,12 @@ fn ssh_resize(state: State<AppState>, session_id: String, cols: u32, rows: u32) 
 
 #[tauri::command]
 fn ssh_close(state: State<AppState>, session_id: String) {
-    if let Some(s) = state.sessions.lock().unwrap().remove(&session_id) {
+    close_session(&state, &session_id);
+}
+
+fn close_session(state: &AppState, session_id: &str) {
+    state.routes.lock().unwrap().remove(session_id);
+    if let Some(s) = state.sessions.lock().unwrap().remove(session_id) {
         // A connected shell closes politely; anything still connecting or waiting on a
         // prompt after a few seconds is stopped.
         let _ = s.input.send(Input::Close);
@@ -626,8 +676,9 @@ fn ssh_close(state: State<AppState>, session_id: String) {
 /// Connect a Files tab to a host (SFTP for SSH hosts, FTP/FTPS otherwise). Progress, prompts
 /// and the result arrive on `events`, like a terminal's connection.
 #[tauri::command]
-fn fs_open(state: State<AppState>, session_id: String, host_id: String, events: Channel<Value>) -> CmdResult<()> {
-    let ctx = Ctx { store: state.store.clone(), prompts: state.prompts.clone(), events };
+fn fs_open(state: State<AppState>, window: tauri::Window, session_id: String, host_id: String, events: Channel<Value>) -> CmdResult<()> {
+    let events: Relay<Value> = events.into();
+    let ctx = Ctx { store: state.store.clone(), prompts: state.prompts.clone(), events: events.clone() };
     let slots = state.files.clone();
     let sid = session_id.clone();
     // Hold the lock while spawning, so the task can't finish before its slot exists.
@@ -638,9 +689,10 @@ fn fs_open(state: State<AppState>, session_id: String, host_id: String, events: 
                 let remote = Arc::new(remote);
                 let wanted = {
                     let mut m = slots.lock().unwrap();
-                    let wanted = matches!(m.get(&sid), Some(FsSlot::Connecting(_)));
-                    if wanted {
-                        m.insert(sid, FsSlot::Ready(remote.clone()));
+                    let tab = m.get_mut(&sid).filter(|t| matches!(t.slot, FsSlot::Connecting(_)));
+                    let wanted = tab.is_some();
+                    if let Some(t) = tab {
+                        t.slot = FsSlot::Ready(remote.clone());
                     }
                     wanted
                 };
@@ -653,8 +705,9 @@ fn fs_open(state: State<AppState>, session_id: String, host_id: String, events: 
             Err(e) => ctx.status("error", format!("{e:#}")),
         }
     });
-    if let Some(old) = map.insert(session_id, FsSlot::Connecting(task)) {
-        close_slot(old);
+    let tab = FsTab { slot: FsSlot::Connecting(task), events, window: window.label().to_string() };
+    if let Some(old) = map.insert(session_id, tab) {
+        close_slot(old.slot);
     }
     Ok(())
 }
@@ -670,13 +723,13 @@ fn close_slot(slot: FsSlot) {
 
 #[tauri::command]
 fn fs_close(state: State<AppState>, session_id: String) {
-    if let Some(slot) = state.files.lock().unwrap().remove(&session_id) {
-        close_slot(slot);
+    if let Some(tab) = state.files.lock().unwrap().remove(&session_id) {
+        close_slot(tab.slot);
     }
 }
 
 fn remote(state: &State<'_, AppState>, session_id: &str) -> CmdResult<Arc<files::Remote>> {
-    match state.files.lock().unwrap().get(session_id) {
+    match state.files.lock().unwrap().get(session_id).map(|t| &t.slot) {
         Some(FsSlot::Ready(r)) => Ok(r.clone()),
         _ => Err("Not connected".into()),
     }
@@ -743,6 +796,403 @@ fn fs_cancel(state: State<AppState>, session_id: String, transfer_id: String) {
     }
 }
 
+// ---------- AI agents (MCP) ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct McpStatus {
+    enabled: bool,
+    running: bool,
+    port: u16,
+    url: String,
+    error: Option<String>,
+    /// For the stdio setup (`<exe> --mcp`).
+    exe: String,
+}
+
+/// Start or stop the server to match the saved setting.
+async fn mcp_apply(state: &AppState) -> McpStatus {
+    let (enabled, port) = {
+        let s = state.store.lock().unwrap();
+        (s.data.mcp.enabled, s.data.mcp.port)
+    };
+    let mut slot = state.mcp_server.lock().await;
+    let restart = slot.0.as_ref().is_some_and(|srv| !enabled || srv.port != port);
+    if restart || !enabled {
+        if let Some(srv) = slot.0.take() {
+            srv.stop();
+            state.mcp.deny_all();
+        }
+        slot.1 = None;
+    }
+    if enabled && slot.0.is_none() {
+        match mcp::start(state.mcp.clone(), port).await {
+            Ok(srv) => *slot = (Some(srv), None),
+            Err(e) => slot.1 = Some(format!("{e:#}")),
+        }
+    }
+    McpStatus {
+        enabled,
+        running: slot.0.is_some(),
+        port,
+        url: format!("http://127.0.0.1:{port}/mcp"),
+        error: slot.1.clone(),
+        exe: mcp::exe_path(),
+    }
+}
+
+#[tauri::command]
+async fn mcp_status(state: State<'_, AppState>) -> CmdResult<McpStatus> {
+    Ok(mcp_apply(&state).await)
+}
+
+#[tauri::command]
+async fn mcp_configure(state: State<'_, AppState>, enabled: bool, port: u16) -> CmdResult<McpStatus> {
+    if port < 1024 {
+        return Err("Use a port from 1024 to 65535".into());
+    }
+    {
+        let mut s = state.store.lock().unwrap();
+        s.data.mcp.enabled = enabled;
+        s.data.mcp.port = port;
+        s.save().map_err(|e| format!("Could not save: {e:#}"))?;
+    }
+    state_changed();
+    Ok(mcp_apply(&state).await)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NewToken {
+    id: String,
+    /// Shown to the user once; Nimbus keeps only its hash.
+    token: String,
+    state: Snapshot,
+}
+
+#[tauri::command]
+fn mcp_create_agent(state: State<AppState>, name: String) -> CmdResult<NewToken> {
+    let token = mcp::new_token();
+    let id = new_id();
+    let snap = mutate(&state, |s| {
+        let name = name.trim();
+        if name.is_empty() {
+            anyhow::bail!("Give the agent a name, like “Claude Code”");
+        }
+        s.data.mcp.agents.push(McpAgent {
+            id: id.clone(),
+            name: name.to_string(),
+            token_hash: mcp::token_hash(&token),
+            token_hint: mcp::token_hint(&token),
+            created: now_ms(),
+            commands: "ask".into(),
+            requests: "ask".into(),
+            ..Default::default()
+        });
+        Ok(())
+    })?;
+    Ok(NewToken { id, token, state: snap })
+}
+
+/// A new token for an agent; the old one stops working straight away.
+#[tauri::command]
+fn mcp_regenerate_token(state: State<AppState>, id: String) -> CmdResult<NewToken> {
+    let token = mcp::new_token();
+    let snap = mutate(&state, |s| {
+        let a = s.data.mcp.agents.iter_mut().find(|a| a.id == id).ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
+        a.token_hash = mcp::token_hash(&token);
+        a.token_hint = mcp::token_hint(&token);
+        Ok(())
+    })?;
+    state.mcp.forget_agent(&id);
+    Ok(NewToken { id, token, state: snap })
+}
+
+/// Name, access and approval settings. The token can't be set from here.
+#[tauri::command]
+fn mcp_save_agent(state: State<AppState>, agent: McpAgent) -> CmdResult<Snapshot> {
+    let id = agent.id.clone();
+    let snap = mutate(&state, |s| {
+        let a = s.data.mcp.agents.iter_mut().find(|a| a.id == agent.id).ok_or_else(|| anyhow::anyhow!("Agent not found"))?;
+        let name = agent.name.trim();
+        if name.is_empty() {
+            anyhow::bail!("Give the agent a name");
+        }
+        let policy = |p: &str| if p == "allow" { "allow".to_string() } else { "ask".to_string() };
+        *a = McpAgent {
+            id: a.id.clone(),
+            name: name.to_string(),
+            token_hash: a.token_hash.clone(),
+            token_hint: a.token_hint.clone(),
+            created: a.created,
+            last_used: a.last_used,
+            commands: policy(&agent.commands),
+            requests: policy(&agent.requests),
+            ..agent
+        };
+        Ok(())
+    })?;
+    // Access may have shrunk: earlier "allow for 30 minutes" answers no longer apply.
+    state.mcp.forget_agent(&id);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn mcp_delete_agent(state: State<AppState>, id: String) -> CmdResult<Snapshot> {
+    let snap = mutate(&state, |s| {
+        s.data.mcp.agents.retain(|a| a.id != id);
+        Ok(())
+    })?;
+    state.mcp.forget_agent(&id);
+    Ok(snap)
+}
+
+#[tauri::command]
+fn mcp_decide(state: State<AppState>, id: String, decision: mcp::Decision) {
+    state.mcp.decide(&id, decision);
+}
+
+#[tauri::command]
+fn mcp_activity(state: State<AppState>) -> Vec<mcp::Activity> {
+    state.mcp.activity()
+}
+
+#[tauri::command]
+fn mcp_clear_activity(state: State<AppState>) {
+    state.mcp.clear_activity();
+}
+
+/// `Nimbus --mcp`: the stdio bridge for MCP clients that start a command.
+pub fn mcp_stdio() -> i32 {
+    mcp::stdio_main()
+}
+
+// ---------- tabs in their own windows ----------
+
+/// Hold a tab's output and route it to `target` (a window label), or to a new window at
+/// (x, y) when `target` is None. `payload` is what the receiving window needs to show the tab
+/// (scrollback, paths, …). Returns the window the tab is going to.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn tab_handoff(
+    app: tauri::AppHandle,
+    state: State<AppState>,
+    session_id: String,
+    payload: Value,
+    target: Option<String>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> CmdResult<String> {
+    let label = match target {
+        Some(t) if app.get_webview_window(&t).is_some() => t,
+        Some(_) => return Err("That window has closed".into()),
+        None => format!("tab-{}", &new_id()[..8]),
+    };
+    {
+        let mut routes = state.routes.lock().unwrap();
+        let mut files = state.files.lock().unwrap();
+        if let Some(r) = routes.get_mut(&session_id) {
+            r.events.hold();
+            if let Some(d) = &r.data {
+                d.hold();
+            }
+            r.window = label.clone();
+        } else if let Some(t) = files.get_mut(&session_id) {
+            t.events.hold();
+            t.window = label.clone();
+        } else {
+            return Err("This tab's connection has ended".into());
+        }
+    }
+    state.handoffs.lock().unwrap().insert(session_id.clone(), payload);
+    if app.get_webview_window(&label).is_some() {
+        use tauri::Emitter;
+        app.emit_to(&label, "tab-adopt", &session_id).map_err(err)?;
+    } else {
+        build_window(&app, &label, Some(&session_id), Some((x, y, width, height))).map_err(err)?;
+    }
+    Ok(label)
+}
+
+/// The receiving window takes the tab's details, once.
+#[tauri::command]
+fn tab_claim(state: State<AppState>, session_id: String) -> CmdResult<Value> {
+    state.handoffs.lock().unwrap().remove(&session_id).ok_or_else(|| "This tab is no longer waiting to move".into())
+}
+
+/// Connect a moved tab's output to this window's channels, delivering anything held meanwhile.
+#[tauri::command]
+fn tab_attach(
+    state: State<AppState>,
+    window: tauri::Window,
+    session_id: String,
+    events: Channel<Value>,
+    // Terminal output; Files tabs pass a channel that goes unused.
+    data: Channel<InvokeResponseBody>,
+) -> CmdResult<()> {
+    let label = window.label().to_string();
+    if let Some(r) = state.routes.lock().unwrap().get_mut(&session_id) {
+        if let (Some(relay), ch) = (&r.data, data) {
+            relay.attach(ch);
+        }
+        r.events.attach(events);
+        r.window = label;
+        return Ok(());
+    }
+    if let Some(t) = state.files.lock().unwrap().get_mut(&session_id) {
+        t.events.attach(events);
+        t.window = label;
+        return Ok(());
+    }
+    Err("This tab's connection has ended".into())
+}
+
+/// Ask whichever window shows a tab to send it to `target`.
+#[tauri::command]
+fn tab_move(app: tauri::AppHandle, state: State<AppState>, session_id: String, target: String) -> CmdResult<()> {
+    use tauri::Emitter;
+    let owner = state
+        .routes
+        .lock()
+        .unwrap()
+        .get(&session_id)
+        .map(|r| r.window.clone())
+        .or_else(|| state.files.lock().unwrap().get(&session_id).map(|t| t.window.clone()))
+        .ok_or("This tab's connection has ended")?;
+    if owner == target {
+        return Ok(());
+    }
+    app.emit_to(&owner, "tab-release", serde_json::json!({ "sessionId": session_id, "target": target })).map_err(err)
+}
+
+/// Move a window so it follows the pointer while its tab is dragged (logical screen coordinates).
+#[tauri::command]
+fn tab_window_move(app: tauri::AppHandle, label: String, x: f64, y: f64) {
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.set_position(tauri::LogicalPosition::new(x, y));
+    }
+}
+
+/// While a tab is dragged: which other window's tab bar is under the pointer (if any). That
+/// window is told to highlight its tab bar; `done` clears the highlight.
+#[tauri::command]
+fn tab_drag_over(app: tauri::AppHandle, exclude: Vec<String>, x: f64, y: f64, done: bool) -> Option<String> {
+    use tauri::Emitter;
+    let mut hit = None;
+    for (label, w) in app.webview_windows() {
+        if exclude.contains(&label) || !w.is_visible().unwrap_or(false) || w.is_minimized().unwrap_or(false) {
+            continue;
+        }
+        let (Ok(pos), Ok(size), Ok(scale)) = (w.outer_position(), w.outer_size(), w.scale_factor()) else { continue };
+        let (left, top) = (pos.x as f64 / scale, pos.y as f64 / scale);
+        let width = size.width as f64 / scale;
+        // The tab bar, with some slack above and below so it's easy to hit.
+        if x >= left && x <= left + width && y >= top - 10.0 && y <= top + 56.0 {
+            hit = Some(label);
+            break;
+        }
+    }
+    for label in app.webview_windows().keys() {
+        let on = !done && hit.as_deref() == Some(label.as_str());
+        let _ = app.emit_to(label.as_str(), "tab-drop-hover", on);
+    }
+    hit
+}
+
+/// A tab window with no tabs left closes itself.
+#[tauri::command]
+fn close_tab_window(window: tauri::WebviewWindow) {
+    if window.label() != "main" {
+        let _ = window.destroy();
+    }
+}
+
+#[tauri::command]
+fn focus_window(app: tauri::AppHandle, label: String) {
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
+/// A window closed: end the connections of the tabs it was showing.
+fn window_closed(app: &tauri::AppHandle, label: &str) {
+    let state = app.state::<AppState>();
+    let terms: Vec<String> = state.routes.lock().unwrap().iter().filter(|(_, r)| r.window == label).map(|(k, _)| k.clone()).collect();
+    for sid in terms {
+        close_session(&state, &sid);
+    }
+    let fs: Vec<FsTab> = {
+        let mut files = state.files.lock().unwrap();
+        let ids: Vec<String> = files.iter().filter(|(_, t)| t.window == label).map(|(k, _)| k.clone()).collect();
+        ids.iter().filter_map(|k| files.remove(k)).collect()
+    };
+    for t in fs {
+        close_slot(t.slot);
+    }
+}
+
+/// The main window, or a tab window (`adopt` is the tab it opens with). Links to websites open
+/// in the default browser, never inside Nimbus.
+fn build_window(app: &tauri::AppHandle, label: &str, adopt: Option<&str>, frame: Option<(f64, f64, f64, f64)>) -> tauri::Result<tauri::WebviewWindow> {
+    let mut config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == "main")
+        .cloned()
+        .expect("no main window in tauri.conf.json");
+    config.label = label.to_string();
+    let handle = app.clone();
+    let mut b = tauri::WebviewWindowBuilder::from_config(app, &config)?.on_navigation(move |url| {
+        if is_app_url(url) {
+            return true;
+        }
+        if matches!(url.scheme(), "http" | "https" | "mailto") {
+            use tauri_plugin_opener::OpenerExt;
+            let _ = handle.opener().open_url(url.as_str(), None::<&str>);
+        }
+        false
+    });
+    // Debug builds only: run a scripted UI check (see NIMBUS_DEV_SCRIPT in the README).
+    #[cfg(debug_assertions)]
+    if let Some(script) = std::env::var_os("NIMBUS_DEV_SCRIPT").and_then(|p| std::fs::read_to_string(p).ok()) {
+        b = b.initialization_script(script);
+    }
+    if let Some(sid) = adopt {
+        b = b.initialization_script(format!("window.__NIMBUS_ADOPT__ = {};", serde_json::to_string(sid).unwrap_or_default()));
+    }
+    if let Some((x, y, w, h)) = frame {
+        b = b.position(x, y).inner_size(w.max(760.0), h.max(480.0));
+    }
+    b.build()
+}
+
+/// Events for one window go to that window, or the main one if it's gone.
+pub(crate) fn emit_main<S: Serialize + Clone>(app: &tauri::AppHandle, event: &str, payload: S) {
+    use tauri::Emitter;
+    let target = if app.get_webview_window("main").is_some() {
+        Some("main".to_string())
+    } else {
+        app.webview_windows().keys().next().cloned()
+    };
+    if let Some(t) = target {
+        let _ = app.emit_to(t.as_str(), event, payload);
+    }
+}
+
+/// Debug builds only: lets a NIMBUS_DEV_SCRIPT report what it saw.
+#[tauri::command]
+fn dev_log(window: tauri::Window, message: String) {
+    if cfg!(debug_assertions) {
+        eprintln!("[dev {}] {message}", window.label());
+    }
+}
+
 #[tauri::command]
 fn prompt_reply(state: State<AppState>, id: String, value: Value) {
     state.prompts.reply(&id, value);
@@ -793,7 +1243,10 @@ fn install_mac_menu(app: &tauri::App) -> tauri::Result<()> {
     app.on_menu_event(|app, event| {
         let id = event.id().0.as_str();
         if matches!(id, "new-tab" | "duplicate-tab" | "type-password" | "open-sftp" | "next-tab" | "prev-tab" | "close-tab") {
-            let _ = app.emit("menu", id);
+            // Only the window you're using acts on ⌘W, ⌘T and the rest.
+            if let Some(label) = app.webview_windows().into_iter().find(|(_, w)| w.is_focused().unwrap_or(false)).map(|(l, _)| l) {
+                let _ = app.emit_to(label.as_str(), "menu", id);
+            }
         }
     });
     Ok(())
@@ -821,40 +1274,72 @@ pub fn run() {
                 None => app.path().app_data_dir()?,
             };
             let store = Store::open(dir)?;
+            let _ = APP.set(app.handle().clone());
             // The window is created here rather than from the config so that every navigation
             // can be checked: a link to a website opens in the default browser, never in Nimbus.
-            let config = app
-                .config()
-                .app
-                .windows
-                .iter()
-                .find(|w| w.label == "main")
-                .cloned()
-                .ok_or("no main window in tauri.conf.json")?;
-            let handle = app.handle().clone();
-            tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?
-                .on_navigation(move |url| {
-                    if is_app_url(url) {
-                        return true;
-                    }
-                    if matches!(url.scheme(), "http" | "https" | "mailto") {
-                        use tauri_plugin_opener::OpenerExt;
-                        let _ = handle.opener().open_url(url.as_str(), None::<&str>);
-                    }
-                    false
-                })
-                .build()?;
+            build_window(app.handle(), "main", None, None)?;
             #[cfg(target_os = "macos")]
             install_mac_menu(app)?;
+            let store = Arc::new(Mutex::new(store));
+            let (mcp_tx, mut mcp_rx) = mpsc::unbounded_channel();
             app.manage(AppState {
-                store: Arc::new(Mutex::new(store)),
+                store: store.clone(),
                 sessions: Mutex::new(HashMap::new()),
                 files: Arc::new(Mutex::new(HashMap::new())),
+                routes: Mutex::new(HashMap::new()),
+                handoffs: Mutex::new(HashMap::new()),
                 prompts: Arc::new(Prompts::default()),
+                mcp: Arc::new(mcp::Hub::new(store, mcp_tx)),
+                mcp_server: tokio::sync::Mutex::new((None, None)),
+            });
+            // Agent approvals and activity go to the UI. An approval brings the window forward.
+            let h = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                use tauri::Emitter;
+                while let Some(ev) = mcp_rx.recv().await {
+                    match ev {
+                        mcp::HubEvent::Approval(v) => {
+                            if let Some(w) = h.get_webview_window("main").or_else(|| h.webview_windows().into_values().next()) {
+                                let _ = w.unminimize();
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                                let _ = w.request_user_attention(Some(tauri::UserAttentionType::Critical));
+                            }
+                            emit_main(&h, "mcp-approval", v);
+                        }
+                        mcp::HubEvent::ApprovalClosed(id) => {
+                            emit_main(&h, "mcp-approval-closed", id);
+                        }
+                        mcp::HubEvent::Activity(a) => {
+                            let _ = h.emit("mcp-activity", a);
+                        }
+                    }
+                }
+            });
+            let h = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let status = mcp_apply(&h.state::<AppState>()).await;
+                if let Some(e) = status.error {
+                    eprintln!("nimbus: AI agent server not started: {e}");
+                }
             });
             Ok(())
         })
+        .on_window_event(|w, ev| {
+            if let tauri::WindowEvent::Destroyed = ev {
+                window_closed(w.app_handle(), w.label());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
+            dev_log,
+            tab_handoff,
+            tab_claim,
+            tab_attach,
+            tab_move,
+            tab_window_move,
+            tab_drag_over,
+            close_tab_window,
+            focus_window,
             get_state,
             save_host,
             duplicate_host,
@@ -899,6 +1384,15 @@ pub fn run() {
             fs_transfer,
             fs_cancel,
             prompt_reply,
+            mcp_status,
+            mcp_configure,
+            mcp_create_agent,
+            mcp_regenerate_token,
+            mcp_save_agent,
+            mcp_delete_agent,
+            mcp_decide,
+            mcp_activity,
+            mcp_clear_activity,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Nimbus");

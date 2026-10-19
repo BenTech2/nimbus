@@ -24,7 +24,6 @@ use suppaftp::list::File as FtpFile;
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream as FtpStream};
 use suppaftp::types::FileType;
 use suppaftp::FtpError;
-use tauri::ipc::Channel;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio_rustls::rustls;
@@ -440,7 +439,7 @@ pub enum Backend {
 
 pub struct Remote {
     backend: Backend,
-    events: Channel<Value>,
+    events: crate::ssh::Relay<Value>,
     slots: Semaphore,
     cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }

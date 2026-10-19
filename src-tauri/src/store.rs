@@ -221,6 +221,53 @@ impl Default for Settings {
     }
 }
 
+/// One AI agent allowed to use Nimbus through the MCP server (see `mcp.rs`). An agent sees
+/// only what it has been granted here, and never the secrets themselves unless `reveal` is on
+/// and the user approves each one.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct McpAgent {
+    pub id: String,
+    pub name: String,
+    /// SHA-256 (hex) of the agent's access token. The token itself is shown once and not kept.
+    pub token_hash: String,
+    /// The token's last few characters, so the user can tell tokens apart.
+    pub token_hint: String,
+    pub created: i64,
+    pub last_used: Option<i64>,
+    /// A paused agent is refused until it's switched back on.
+    pub paused: bool,
+    /// Granted hosts: one by one, or every host in a group (including ones added later).
+    pub hosts: Vec<String>,
+    pub host_groups: Vec<String>,
+    pub passwords: Vec<String>,
+    pub password_groups: Vec<String>,
+    pub api_keys: Vec<String>,
+    pub api_groups: Vec<String>,
+    /// "ask" (default): every command waits for the user's OK in Nimbus. "allow": runs straight away.
+    pub commands: String,
+    /// The same, for API / web requests made with a stored credential.
+    pub requests: String,
+    /// The agent may ask to see a secret's value. Every request still needs the user's OK.
+    pub reveal: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct McpConfig {
+    pub enabled: bool,
+    pub port: u16,
+    pub agents: Vec<McpAgent>,
+}
+
+pub const MCP_DEFAULT_PORT: u16 = 47821;
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig { enabled: false, port: MCP_DEFAULT_PORT, agents: vec![] }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Data {
@@ -236,6 +283,8 @@ pub struct Data {
     pub api_groups: Vec<PasswordGroup>,
     pub known_hosts: Vec<KnownHost>,
     pub settings: Settings,
+    /// AI agent access. Belongs to this computer, so it's never exported.
+    pub mcp: McpConfig,
 }
 
 /// Secret material for one host (password) or one key (private key + passphrase).

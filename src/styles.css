@@ -145,8 +145,8 @@ body.mac #titlebar { padding-left: 80px; }
 #home { display: grid; grid-template-columns: 210px 1fr auto; height: 100%; }
 #sidebar { background: var(--sidebar); border-right: 1px solid var(--border); padding: 14px 10px; display: flex; flex-direction: column; gap: 2px; overflow-y: auto; }
 .brand { display: flex; align-items: center; gap: 9px; padding: 2px 8px 16px; font-weight: 650; font-size: 15px; letter-spacing: 0.2px; }
-.brand .logo { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg, #4f8cff, #7b5cff); display: grid; place-items: center; }
-.brand .logo svg { width: 15px; height: 15px; color: white; }
+.brand .logo { width: 26px; height: 26px; display: block; filter: drop-shadow(0 1px 2px rgba(11, 20, 64, 0.25)); }
+.tab .app-logo { width: 15px; height: 15px; flex-shrink: 0; display: block; }
 .nav-item {
   display: flex; align-items: center; gap: 10px;
   padding: 7px 10px; border-radius: 7px;
@@ -498,3 +498,68 @@ tr.clickable { cursor: default; }
 .pw-meter[data-level='2'] div { width: 50%; background: var(--warn); }
 .pw-meter[data-level='3'] div { width: 75%; background: var(--ok); }
 .pw-meter[data-level='4'] div { width: 100%; background: var(--ok); }
+
+/* Hosts: grouped like the Passwords list */
+.group-head { cursor: pointer; margin-top: 4px; }
+.group-head:hover, .group-row[data-group-head]:hover td { color: var(--text); }
+.group-row[data-group-head] { cursor: pointer; }
+.group-head .swatch { margin-right: -2px; }
+.chip-note { margin-left: 4px; font-size: 12px; }
+.hosts-table .pw-name .title { display: flex; align-items: center; gap: 6px; overflow: hidden; text-overflow: ellipsis; }
+
+/* AI agents (MCP) */
+.ok-text { color: var(--ok); }
+.warn-text { color: var(--warn); }
+.badge { display: inline-block; font-size: 10.5px; font-weight: 650; letter-spacing: 0.3px; border-radius: 5px; padding: 1px 6px; border: 1px solid var(--border-strong); color: var(--muted); white-space: nowrap; }
+.badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+.badge.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+.badge.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 45%, transparent); }
+.mcp-points { margin: 0 0 14px; padding-left: 18px; max-width: 760px; }
+.mcp-points li { margin: 3px 0; }
+#mcp-panel .section-title .spacer { flex: 1; }
+#mcp-panel .section-title .btn { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.mcp-agents { max-width: none; margin-bottom: 6px; }
+.mcp-agents .avatar svg { width: 15px; height: 15px; }
+.mcp-log { max-width: none; font-size: 12.5px; }
+.mcp-log td { vertical-align: top; padding-top: 7px; padding-bottom: 7px; }
+.mcp-log td:first-child { white-space: nowrap; width: 90px; }
+.mcp-log td:nth-child(2) { white-space: nowrap; width: 130px; }
+.mcp-log td:last-child { width: 80px; text-align: right; }
+.mcp-log .sub { color: var(--muted); font-size: 11.5px; margin-top: 2px; white-space: pre-wrap; word-break: break-all; max-height: 3.2em; overflow: hidden; }
+.mcp-on { display: flex; align-items: center; gap: 8px; margin: auto 0 0; padding: 7px 10px; border-radius: 8px; color: var(--ok); font-size: 12px; background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.mcp-on svg { width: 15px; height: 15px; flex-shrink: 0; }
+.mcp-on + .sidebar-foot { margin-top: 8px; }
+@media (max-width: 760px) { .mcp-on .text { display: none; } .mcp-on { justify-content: center; } }
+.modal.wide { width: min(640px, calc(100vw - 32px)); }
+pre.snippet { margin: 0 0 10px; padding: 10px 12px; background: var(--field); border: 1px solid var(--border); border-radius: 8px; font: 12px/1.5 var(--mono, ui-monospace, Menlo, Consolas, monospace); white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; color: var(--text); }
+.setup-block { margin: 14px 0 4px; }
+.setup-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.setup-block .hint { margin: 4px 0 6px; }
+.approval-target { display: flex; align-items: center; gap: 8px; font-weight: 560; margin: 4px 0 14px; }
+.approval-target svg { width: 16px; height: 16px; color: var(--accent); flex-shrink: 0; }
+.approval .legend { font-size: 11px; font-weight: 650; letter-spacing: 0.7px; text-transform: uppercase; color: var(--faint); margin-bottom: 6px; }
+.approval .warnbox { margin: 4px 0 8px; }
+.grant { border: 1px solid var(--border); border-radius: 9px; padding: 0 10px; margin-bottom: 8px; background: var(--card); }
+.grant summary { cursor: pointer; padding: 9px 0; font-weight: 560; list-style-position: inside; }
+.grant summary .n { float: right; font-weight: 400; font-size: 12px; color: var(--faint); }
+.grant[open] { padding-bottom: 8px; }
+.grant-group { border-top: 1px solid var(--border); padding-top: 4px; margin-top: 4px; }
+.grant-item { display: flex; gap: 9px; align-items: flex-start; padding: 5px 2px; cursor: pointer; }
+.grant-item input { margin-top: 3px; }
+.grant-item small { display: block; color: var(--muted); font-size: 11.5px; }
+.grant-item.in-group { padding-left: 22px; }
+.grant-item:has(input:disabled) { opacity: 0.6; cursor: default; }
+.grant-item .swatch { vertical-align: 0; margin-right: 2px; }
+.segmented.two label { padding: 7px 4px; }
+.hosts-table td.row-actions { white-space: nowrap; }
+.hosts-table td.row-actions .icon-btn { display: inline-grid; vertical-align: middle; }
+.mcp-on { border: 1px solid transparent; }
+
+/* Dragging tabs between windows */
+body.tab-dragging, body.tab-dragging * { cursor: grabbing !important; }
+.tab.drag-src { opacity: 0.6; }
+body.tab-dragging .tab.drag-src { opacity: 1; background: var(--tab-active); border-color: var(--accent); box-shadow: 0 4px 14px var(--shadow); }
+body.tab-drop-target #titlebar { background: color-mix(in srgb, var(--accent) 16%, var(--tabbar)); box-shadow: inset 0 -2px 0 var(--accent); transition: background 0.12s; }
+body.tab-drop-target #tabs::after { content: 'Drop to add the tab here'; align-self: center; margin-left: 8px; font-size: 12px; color: var(--accent); white-space: nowrap; }
+/* A window holding tabs dragged out of the main one: just the tabs, no home screen. */
+body.tab-window #home { display: none !important; }

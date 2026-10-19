@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Main window permissions",
-  "windows": ["main"],
+  "description": "Permissions for Nimbus windows: the main one and tabs dragged into their own window",
+  "windows": ["main", "tab-*"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",

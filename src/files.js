@@ -195,7 +195,7 @@ class Pane {
 }
 
 export class FileSession {
-  constructor(app, host) {
+  constructor(app, host, { adopting = false } = {}) {
     this.app = app;
     this.kind = 'files';
     this.id = uid();
@@ -228,7 +228,7 @@ export class FileSession {
     this.remote = new Pane(this, 'remote');
     this.panes = [this.local, this.remote];
     this.wire();
-    this.local.load('');
+    if (!adopting) this.local.load('');
   }
 
   // ---------- connection ----------
@@ -262,6 +262,7 @@ export class FileSession {
 
   setState(state, message = '') {
     this.state = state;
+    this.message = message;
     const host = this.app.host(this.hostId);
     const name = esc(host ? host.label || host.address : this.label);
     const busy = state === 'connecting' || state === 'authenticating';
@@ -490,6 +491,32 @@ export class FileSession {
       const folder = this.remote.entryAt(over);
       (folder?.isDir ? over.closest('.frow') : this.remote.listEl).classList.add('drop-target');
     }
+  }
+
+  // ---------- moving to another window (same shape as TermSession) ----------
+  cantMove() {
+    if (this.promptCtl) return 'Answer the login prompt first';
+    if ([...this.transfers.values()].some((t) => t.state === 'queued' || t.state === 'running')) return 'Wait for the transfers to finish first';
+    return null;
+  }
+
+  handoffPayload() {
+    return { kind: 'files', hostId: this.hostId, label: this.label, sid: this.sid, state: this.state, message: this.message, local: this.local.path, remote: this.remote.path };
+  }
+
+  async adoptFrom(p) {
+    this.sid = p.sid;
+    const sid = p.sid;
+    this.setState(p.state, p.message || '');
+    this.local.load(p.local ?? '');
+    await api.tabAttach(sid, (ev) => { if (sid === this.sid) this.onEvent(ev); });
+    if (this.state === 'connected') this.remote.load(p.remote ?? '');
+  }
+
+  release() {
+    this.promptCtl?.cancel?.();
+    this.sid = null;
+    this.el.remove();
   }
 
   // ---------- tab lifecycle (same shape as TermSession) ----------

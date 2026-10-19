@@ -49,11 +49,70 @@ impl Prompts {
     }
 }
 
+/// Where a tab's events or output go: the tab's channel in its window, or held for a moment while
+/// the tab moves to another window (then delivered there in order, so nothing is lost).
+pub struct Relay<T: tauri::ipc::IpcResponse> {
+    state: Arc<Mutex<RelayState<T>>>,
+}
+
+enum RelayState<T: tauri::ipc::IpcResponse> {
+    Live(Channel<T>),
+    Held(Vec<T>),
+}
+
+/// Messages kept while held; a tab that never arrives can't grow this without limit.
+const HELD_MAX: usize = 50_000;
+
+impl<T: tauri::ipc::IpcResponse> Clone for Relay<T> {
+    fn clone(&self) -> Self {
+        Relay { state: self.state.clone() }
+    }
+}
+
+impl<T: tauri::ipc::IpcResponse> From<Channel<T>> for Relay<T> {
+    fn from(ch: Channel<T>) -> Self {
+        Relay { state: Arc::new(Mutex::new(RelayState::Live(ch))) }
+    }
+}
+
+impl<T: tauri::ipc::IpcResponse> Relay<T> {
+    pub fn send(&self, v: T) -> tauri::Result<()> {
+        match &mut *self.state.lock().unwrap() {
+            RelayState::Live(ch) => ch.send(v),
+            RelayState::Held(buf) => {
+                if buf.len() < HELD_MAX {
+                    buf.push(v);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Start holding messages (the tab is leaving its window).
+    pub fn hold(&self) {
+        let mut st = self.state.lock().unwrap();
+        if matches!(*st, RelayState::Live(_)) {
+            *st = RelayState::Held(Vec::new());
+        }
+    }
+
+    /// Deliver to a new channel, starting with anything held.
+    pub fn attach(&self, ch: Channel<T>) {
+        let mut st = self.state.lock().unwrap();
+        if let RelayState::Held(buf) = std::mem::replace(&mut *st, RelayState::Held(Vec::new())) {
+            for v in buf {
+                let _ = ch.send(v);
+            }
+        }
+        *st = RelayState::Live(ch);
+    }
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub store: Arc<Mutex<Store>>,
     pub prompts: Arc<Prompts>,
-    pub events: Channel<Value>,
+    pub events: Relay<Value>,
 }
 
 impl Ctx {
@@ -88,6 +147,8 @@ impl Ctx {
         if let Err(e) = s.save() {
             eprintln!("nimbus: failed to save data: {e:#}");
         }
+        drop(s);
+        crate::state_changed();
     }
 }
 
@@ -469,7 +530,7 @@ pub async fn run_session(
     host_id: String,
     cols: u32,
     rows: u32,
-    data: Channel<InvokeResponseBody>,
+    data: Relay<InvokeResponseBody>,
     mut rx: mpsc::UnboundedReceiver<Input>,
 ) {
     match session_inner(&ctx, &host_id, cols, rows, &data, &mut rx).await {
@@ -483,7 +544,7 @@ async fn session_inner(
     host_id: &str,
     cols: u32,
     rows: u32,
-    data: &Channel<InvokeResponseBody>,
+    data: &Relay<InvokeResponseBody>,
     rx: &mut mpsc::UnboundedReceiver<Input>,
 ) -> anyhow::Result<String> {
     let host = ctx
