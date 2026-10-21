@@ -1,10 +1,13 @@
 mod files;
 mod keys;
+mod desktop;
 mod mcp;
+mod rdp;
 mod serial;
 mod ssh;
 mod sshconfig;
 mod store;
+mod vnc;
 mod transfer;
 mod vault;
 #[cfg(test)]
@@ -138,7 +141,7 @@ fn save_host(state: State<AppState>, mut host: Host, password: Option<String>) -
         host.key_id = blank_to_none(host.key_id);
         host.jump_host_id = blank_to_none(host.jump_host_id).filter(|j| *j != host.id);
         host.port = host.port.filter(|p| *p != 0);
-        if !matches!(host.protocol.as_str(), "ssh" | "ftp" | "ftps" | "serial") {
+        if !matches!(host.protocol.as_str(), "ssh" | "ftp" | "ftps" | "serial" | "rdp" | "vnc") {
             host.protocol = "ssh".into();
         }
         if !host.is_serial() {
@@ -155,7 +158,17 @@ fn save_host(state: State<AppState>, mut host: Host, password: Option<String>) -
         }
         if !host.is_ssh() {
             host.key_id = None;
-            host.jump_host_id = None;
+            if !host.is_rdp() && !host.is_vnc() {
+                host.jump_host_id = None;
+            }
+        }
+        if host.is_rdp() || host.is_vnc() {
+            host.use_agent = false;
+        }
+        if host.is_rdp() {
+            host.domain = blank_to_none(host.domain);
+        } else {
+            host.domain = None;
         }
         if let Some(pw) = password {
             s.update_secret(&host.id, |sec| sec.password = (!pw.is_empty()).then_some(pw));
@@ -626,6 +639,118 @@ fn ssh_connect(
     Ok(())
 }
 
+/// This computer's clipboard, for Remote Desktop's copy and paste.
+struct AppClipboard;
+
+impl desktop::Clipboard for AppClipboard {
+    fn read(&self) -> Option<String> {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        APP.get()?.clipboard().read_text().ok()
+    }
+
+    fn write(&self, text: String) {
+        use tauri_plugin_clipboard_manager::ClipboardExt;
+        if let Some(app) = APP.get() {
+            let _ = app.clipboard().write_text(text);
+        }
+    }
+}
+
+/// Open a Remote Desktop tab. `width` × `height` is the tab's area in device pixels and `scale`
+/// the display scale (100 = 100%), so the remote desktop fits it exactly.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn rdp_connect(
+    state: State<AppState>,
+    window: tauri::Window,
+    session_id: String,
+    host_id: String,
+    width: u32,
+    height: u32,
+    scale: u32,
+    events: Channel<Value>,
+    data: Channel<InvokeResponseBody>,
+) -> CmdResult<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (events, data): (Relay<Value>, Relay<InvokeResponseBody>) = (events.into(), data.into());
+    state.routes.lock().unwrap().insert(
+        session_id.clone(),
+        TabRoute { window: window.label().to_string(), events: events.clone(), data: Some(data.clone()) },
+    );
+    let ctx = Ctx { store: state.store.clone(), prompts: state.prompts.clone(), events };
+    let clipboard: Arc<dyn desktop::Clipboard> = Arc::new(AppClipboard);
+    let task = tauri::async_runtime::spawn(rdp::run_session(ctx, host_id, width, height, scale, data, Some(clipboard), rx));
+    let old = state.sessions.lock().unwrap().insert(session_id, Session { input: tx, task });
+    if let Some(old) = old {
+        old.task.abort();
+    }
+    Ok(())
+}
+
+/// Open a VNC tab. `width` × `height` is the size the remote desktop should be, if the server
+/// can resize it.
+#[allow(clippy::too_many_arguments)]
+#[tauri::command]
+fn vnc_connect(
+    state: State<AppState>,
+    window: tauri::Window,
+    session_id: String,
+    host_id: String,
+    width: u32,
+    height: u32,
+    events: Channel<Value>,
+    data: Channel<InvokeResponseBody>,
+) -> CmdResult<()> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (events, data): (Relay<Value>, Relay<InvokeResponseBody>) = (events.into(), data.into());
+    state.routes.lock().unwrap().insert(
+        session_id.clone(),
+        TabRoute { window: window.label().to_string(), events: events.clone(), data: Some(data.clone()) },
+    );
+    let ctx = Ctx { store: state.store.clone(), prompts: state.prompts.clone(), events };
+    let clipboard: Arc<dyn desktop::Clipboard> = Arc::new(AppClipboard);
+    let task = tauri::async_runtime::spawn(vnc::run_session(ctx, host_id, width, height, data, Some(clipboard), rx));
+    let old = state.sessions.lock().unwrap().insert(session_id, Session { input: tx, task });
+    if let Some(old) = old {
+        old.task.abort();
+    }
+    Ok(())
+}
+
+fn desktop_send(state: &AppState, session_id: &str, cmd: desktop::Cmd) {
+    if let Some(s) = state.sessions.lock().unwrap().get(session_id) {
+        let _ = s.input.send(Input::Desktop(cmd));
+    }
+}
+
+#[tauri::command]
+fn desktop_input(state: State<AppState>, session_id: String, events: Vec<desktop::Ev>) {
+    desktop_send(&state, &session_id, desktop::Cmd::Input(events));
+}
+
+#[tauri::command]
+fn desktop_resize(state: State<AppState>, session_id: String, width: u32, height: u32, scale: u32) {
+    desktop_send(&state, &session_id, desktop::Cmd::Resize { width, height, scale });
+}
+
+/// "Type password" in a Remote Desktop or VNC tab: the password goes from the encrypted store to the
+/// remote as typed characters, never through the UI.
+#[tauri::command]
+fn desktop_type_password(state: State<AppState>, session_id: String, secret_id: String) -> CmdResult<()> {
+    let bytes = password_keystrokes(&state.store.lock().unwrap(), &secret_id)?;
+    let text = String::from_utf8(bytes).map_err(|_| "That password can't be typed".to_string())?;
+    if !state.sessions.lock().unwrap().contains_key(&session_id) {
+        return Err("This session is not connected".into());
+    }
+    desktop_send(&state, &session_id, desktop::Cmd::Type(text));
+    Ok(())
+}
+
+#[tauri::command]
+fn desktop_ack(state: State<AppState>, session_id: String, seq: u32) {
+    desktop_send(&state, &session_id, desktop::Cmd::Ack(seq));
+}
+
 #[tauri::command]
 fn ssh_write(state: State<AppState>, session_id: String, data: String) {
     if let Some(s) = state.sessions.lock().unwrap().get(&session_id) {
@@ -1039,6 +1164,8 @@ fn tab_attach(
         }
         r.events.attach(events);
         r.window = label;
+        // A Remote Desktop tab redraws everything in its new window.
+        desktop_send(&state, &session_id, desktop::Cmd::Refresh);
         return Ok(());
     }
     if let Some(t) = state.files.lock().unwrap().get_mut(&session_id) {
@@ -1370,6 +1497,12 @@ pub fn run() {
             import_apply,
             import_ssh_config,
             ssh_connect,
+            rdp_connect,
+            vnc_connect,
+            desktop_input,
+            desktop_resize,
+            desktop_ack,
+            desktop_type_password,
             ssh_write,
             ssh_resize,
             ssh_break,

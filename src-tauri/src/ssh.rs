@@ -28,6 +28,8 @@ pub enum Input {
     Resize(u32, u32),
     /// Serial only: hold the line in the break state briefly (e.g. to reach a router's ROMMON).
     Break,
+    /// Remote Desktop and VNC: keyboard, mouse, resizing and screen updates.
+    Desktop(crate::desktop::Cmd),
     Close,
 }
 
@@ -94,6 +96,11 @@ impl<T: tauri::ipc::IpcResponse> Relay<T> {
         if matches!(*st, RelayState::Live(_)) {
             *st = RelayState::Held(Vec::new());
         }
+    }
+
+    /// Delivering to a window (not held while the tab moves).
+    pub fn is_live(&self) -> bool {
+        matches!(*self.state.lock().unwrap(), RelayState::Live(_))
     }
 
     /// Deliver to a new channel, starting with anything held.
@@ -581,7 +588,7 @@ async fn session_inner(
             input = rx.recv() => match input {
                 Some(Input::Data(bytes)) => channel.data(&bytes[..]).await?,
                 Some(Input::Resize(c, r)) => { let _ = channel.window_change(c, r, 0, 0).await; }
-                Some(Input::Break) => {}
+                Some(Input::Break) | Some(Input::Desktop(_)) => {}
                 Some(Input::Close) | None => { let _ = channel.close().await; break; }
             },
         }

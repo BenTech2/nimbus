@@ -1347,3 +1347,503 @@ fn moving_a_tab_holds_output_then_delivers_it_in_order() {
     assert_eq!(String::from_utf8(first.lock().unwrap().clone()).unwrap(), "one ");
     assert_eq!(String::from_utf8(second.lock().unwrap().clone()).unwrap(), "two three four");
 }
+
+// ---------- Remote Desktop ----------
+// Needs an RDP server: NIMBUS_TEST_RDP=<host:port> with user "tester", password "nimbus-test"
+// (the xrdp container in the README). NIMBUS_TEST_RDP_SHOT=<file.bmp> saves the last screen.
+
+/// xrdp gives each user one session, so the Remote Desktop tests take turns.
+static RDP_SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct MemClipboard(Mutex<Option<String>>, Mutex<Vec<String>>);
+
+impl crate::desktop::Clipboard for MemClipboard {
+    fn read(&self) -> Option<String> {
+        self.0.lock().unwrap().clone()
+    }
+    fn write(&self, text: String) {
+        self.1.lock().unwrap().push(text);
+    }
+}
+
+/// What the UI would have drawn, from a Remote Desktop session's data channel.
+#[derive(Default)]
+struct Canvas {
+    width: usize,
+    height: usize,
+    pixels: Vec<u8>,
+    sizes: Vec<(u16, u16)>,
+    frames: u32,
+    pointers: u32,
+}
+
+impl Canvas {
+    fn apply(&mut self, m: &[u8]) -> Option<u32> {
+        let u16_at = |i: usize| u16::from_le_bytes([m[i], m[i + 1]]);
+        match m[0] {
+            1 => {
+                let seq = u32::from_le_bytes([m[1], m[2], m[3], m[4]]);
+                let mut at = 7;
+                for _ in 0..u16_at(5) {
+                    let (x, y, w, h) = (u16_at(at) as usize, u16_at(at + 2) as usize, u16_at(at + 4) as usize, u16_at(at + 6) as usize);
+                    at += 8;
+                    for row in 0..h {
+                        let dst = ((y + row) * self.width + x) * 4;
+                        self.pixels[dst..dst + w * 4].copy_from_slice(&m[at..at + w * 4]);
+                        at += w * 4;
+                    }
+                }
+                assert_eq!(at, m.len(), "frame message has the wrong length");
+                self.frames += 1;
+                Some(seq)
+            }
+            2 => {
+                let (w, h) = (u16_at(1), u16_at(3));
+                self.sizes.push((w, h));
+                (self.width, self.height) = (w as usize, h as usize);
+                self.pixels = vec![0; self.width * self.height * 4];
+                None
+            }
+            3 => {
+                let (w, h) = (u16_at(1) as usize, u16_at(3) as usize);
+                assert_eq!(m.len(), 9 + w * h * 4, "pointer message has the wrong length");
+                self.pointers += 1;
+                None
+            }
+            4 | 5 => None,
+            k => panic!("unknown message kind {k}"),
+        }
+    }
+
+    /// Distinct colours on screen: a real desktop has many, a blank one has one.
+    fn colours(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        for p in self.pixels.chunks_exact(4).step_by(7) {
+            seen.insert([p[0], p[1], p[2]]);
+        }
+        seen.len()
+    }
+
+    fn save_bmp(&self, path: &str) {
+        let (w, h) = (self.width, self.height);
+        let mut f = Vec::with_capacity(54 + w * h * 4);
+        f.extend_from_slice(b"BM");
+        f.extend_from_slice(&((54 + w * h * 4) as u32).to_le_bytes());
+        f.extend_from_slice(&[0; 4]);
+        f.extend_from_slice(&54u32.to_le_bytes());
+        f.extend_from_slice(&40u32.to_le_bytes());
+        f.extend_from_slice(&(w as i32).to_le_bytes());
+        f.extend_from_slice(&(-(h as i32)).to_le_bytes());
+        f.extend_from_slice(&1u16.to_le_bytes());
+        f.extend_from_slice(&32u16.to_le_bytes());
+        f.extend_from_slice(&[0; 24]);
+        for p in self.pixels.chunks_exact(4) {
+            f.extend_from_slice(&[p[2], p[1], p[0], 255]);
+        }
+        std::fs::write(path, f).unwrap();
+    }
+}
+
+async fn wait_for(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
+    for _ in 0..secs * 10 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rdp_session_draws_resizes_and_shares_the_clipboard() {
+    let Ok(target) = std::env::var("NIMBUS_TEST_RDP") else { return };
+    let _turn = RDP_SERVER.lock().await;
+    let _ = tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).with_test_writer().try_init();
+    let (addr, port) = target.rsplit_once(':').unwrap();
+    let mut s = Store::open(temp_dir("rdp")).unwrap();
+    let id = new_id();
+    s.data.hosts.push(Host {
+        id: id.clone(),
+        label: "desktop".into(),
+        protocol: "rdp".into(),
+        address: addr.into(),
+        port: Some(port.parse().unwrap()),
+        username: Some("tester".into()),
+        ..Default::default()
+    });
+    s.update_secret(&id, |sec| sec.password = Some("nimbus-test".into()));
+    let store = Arc::new(Mutex::new(s));
+
+    let prompts = Arc::new(Prompts::default());
+    let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let (p, l) = (prompts.clone(), log.clone());
+    let events = Channel::<Value>::new(move |body| {
+        if let InvokeResponseBody::Json(s) = body {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["type"] == "prompt" {
+                // Trust the server's certificate the first time.
+                assert_eq!(v["kind"], "hostkey", "unexpected prompt {v}");
+                p.reply(v["id"].as_str().unwrap(), json!({ "accept": true }));
+            }
+            l.lock().unwrap().push(v);
+        }
+        Ok(())
+    });
+    let (tx, rx) = mpsc::unbounded_channel();
+    let canvas = Arc::new(Mutex::new(Canvas::default()));
+    let (c, acks) = (canvas.clone(), tx.clone());
+    let data = Channel::new(move |body| {
+        if let InvokeResponseBody::Raw(b) = body {
+            if let Some(seq) = c.lock().unwrap().apply(&b) {
+                let _ = acks.send(Input::Desktop(crate::desktop::Cmd::Ack(seq)));
+            }
+        }
+        Ok(())
+    });
+    let clipboard = Arc::new(MemClipboard(Mutex::new(None), Mutex::new(vec![])));
+    let ctx = Ctx { store: store.clone(), prompts, events: events.into() };
+    let cb: Arc<dyn crate::desktop::Clipboard> = clipboard.clone();
+    let task = tokio::spawn(crate::rdp::run_session(ctx, id.clone(), 1280, 800, 100, data.into(), Some(cb), rx));
+
+    let state = |l: &Arc<Mutex<Vec<Value>>>| l.lock().unwrap().iter().rev().find(|e| e["type"] == "status").map(|e| e["state"].as_str().unwrap_or("").to_string());
+    wait_for("connected", 30, || matches!(state(&log).as_deref(), Some("connected" | "error" | "closed"))).await;
+    assert_eq!(state(&log).as_deref(), Some("connected"), "{:?}", log.lock().unwrap());
+    // The certificate is remembered for next time.
+    assert!(store.lock().unwrap().known_host(&format!("rdp://{target}")).is_some());
+
+    // The desktop appears at the size asked for.
+    wait_for("the desktop", 30, || canvas.lock().unwrap().colours() > 20).await;
+    assert_eq!(canvas.lock().unwrap().sizes[0], (1280, 800));
+
+    // Keyboard and mouse go through without upsetting the server.
+    use crate::desktop::Ev;
+    tx.send(Input::Desktop(crate::desktop::Cmd::Input(vec![
+        Ev::Move { x: 640, y: 400 },
+        Ev::Button { x: 640, y: 400, b: 0, d: true },
+        Ev::Button { x: 640, y: 400, b: 0, d: false },
+        Ev::Wheel { x: 640, y: 400, v: -120, h: false },
+        Ev::Key { c: 0x2a, e: false, d: true, k: 0xffe1 },
+        Ev::Key { c: 0x2a, e: false, d: false, k: 0xffe1 },
+        Ev::Sync { f: 0 },
+    ])))
+    .unwrap();
+
+    // Resizing the tab resizes the remote desktop, without reconnecting.
+    let frames_before = canvas.lock().unwrap().frames;
+    tx.send(Input::Desktop(crate::desktop::Cmd::Resize { width: 1001, height: 700, scale: 100 })).unwrap();
+    wait_for("the resize", 20, || canvas.lock().unwrap().sizes.last() == Some(&(1000, 700))).await;
+    wait_for("the resized desktop", 20, || {
+        let c = canvas.lock().unwrap();
+        c.frames > frames_before && c.colours() > 20
+    })
+    .await;
+    assert_eq!(state(&log).as_deref(), Some("connected"));
+
+    // Copy on the remote → this computer's clipboard.
+    let exec = |cmd: &str| {
+        std::process::Command::new("docker")
+            .args(["exec", "-u", "tester", "-e", "DISPLAY=:10", "nimbus-xrdp", "sh", "-c", cmd])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+    };
+    if exec("true").is_ok() {
+        exec("printf 'from the remote' | timeout 5 xclip -selection clipboard -loops 1 &").unwrap();
+        wait_for("the remote's clipboard", 10, || clipboard.1.lock().unwrap().iter().any(|t| t == "from the remote")).await;
+
+        // This computer's clipboard → paste on the remote.
+        *clipboard.0.lock().unwrap() = Some("from Nimbus ✓".into());
+        tx.send(Input::Desktop(crate::desktop::Cmd::Input(vec![Ev::Clipboard]))).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pasted = exec("timeout 5 xclip -o -selection clipboard").unwrap();
+        assert_eq!(pasted, "from Nimbus ✓");
+    }
+
+    // Moving to another window: frames stop while held, then everything is sent again.
+    if let Ok(path) = std::env::var("NIMBUS_TEST_RDP_SHOT") {
+        canvas.lock().unwrap().save_bmp(&path);
+    }
+    tx.send(Input::Desktop(crate::desktop::Cmd::Refresh)).unwrap();
+    let sizes = canvas.lock().unwrap().sizes.len();
+    wait_for("the refresh", 10, || canvas.lock().unwrap().sizes.len() > sizes).await;
+
+    tx.send(Input::Close).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+    assert_eq!(state(&log).as_deref(), Some("closed"), "{:?}", log.lock().unwrap().last());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rdp_wrong_password_asks_again_and_refusing_the_certificate_cancels() {
+    let Ok(target) = std::env::var("NIMBUS_TEST_RDP") else { return };
+    let _turn = RDP_SERVER.lock().await;
+    let (addr, port) = target.rsplit_once(':').unwrap();
+    let mut s = Store::open(temp_dir("rdp-cert")).unwrap();
+    let id = new_id();
+    s.data.hosts.push(Host { id: id.clone(), protocol: "rdp".into(), address: addr.into(), port: Some(port.parse().unwrap()), username: Some("tester".into()), ..Default::default() });
+    s.update_secret(&id, |sec| sec.password = Some("nimbus-test".into()));
+    let (events, _) = session_rdp(s, &id, vec![json!({ "accept": false })]).await;
+    let last = events.iter().rev().find(|e| e["type"] == "status").unwrap();
+    assert_eq!(last["state"], "error");
+    assert!(last["message"].as_str().unwrap().contains("not trusted"), "{last}");
+}
+
+/// Run a Remote Desktop session until it ends, answering prompts in order.
+async fn session_rdp(s: Store, id: &str, answers: Vec<Value>) -> (Vec<Value>, ()) {
+    let prompts = Arc::new(Prompts::default());
+    let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let answers = Arc::new(Mutex::new(VecDeque::from(answers)));
+    let (p, l) = (prompts.clone(), log.clone());
+    let events = Channel::<Value>::new(move |body| {
+        if let InvokeResponseBody::Json(s) = body {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["type"] == "prompt" {
+                p.reply(v["id"].as_str().unwrap(), answers.lock().unwrap().pop_front().unwrap_or(Value::Null));
+            }
+            l.lock().unwrap().push(v);
+        }
+        Ok(())
+    });
+    let (_tx, rx) = mpsc::unbounded_channel();
+    let ctx = Ctx { store: Arc::new(Mutex::new(s)), prompts, events: events.into() };
+    let task = tokio::spawn(crate::rdp::run_session(ctx, id.to_string(), 1024, 768, 100, Channel::new(|_| Ok(())).into(), None, rx));
+    tokio::time::timeout(Duration::from_secs(30), task).await.unwrap().unwrap();
+    let ev = log.lock().unwrap().clone();
+    (ev, ())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rdp_through_an_ssh_jump_host() {
+    let (Ok(target), Some(dir)) = (std::env::var("NIMBUS_TEST_RDP"), sshd_dir()) else { return };
+    let _turn = RDP_SERVER.lock().await;
+    let (addr, port) = target.rsplit_once(':').unwrap();
+    let mut s = Store::open(temp_dir("rdp-jump")).unwrap();
+    let key = add_key(&mut s, dir.join("client"), None);
+    let jump = add_host(&mut s, Some(key), None);
+    trust_test_host(&mut s, &dir, 2222);
+    let id = new_id();
+    s.data.hosts.push(Host { id: id.clone(), protocol: "rdp".into(), address: addr.into(), port: Some(port.parse().unwrap()), username: Some("tester".into()), jump_host_id: Some(jump), ..Default::default() });
+    s.update_secret(&id, |sec| sec.password = Some("nimbus-test".into()));
+    // Answers: trust the RDP certificate. Once connected, the test closes the session.
+    let prompts = Arc::new(Prompts::default());
+    let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let (p, l) = (prompts.clone(), log.clone());
+    let events = Channel::<Value>::new(move |body| {
+        if let InvokeResponseBody::Json(s) = body {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["type"] == "prompt" {
+                p.reply(v["id"].as_str().unwrap(), json!({ "accept": true }));
+            }
+            l.lock().unwrap().push(v);
+        }
+        Ok(())
+    });
+    let frames = Arc::new(Mutex::new(0u32));
+    let f = frames.clone();
+    let (tx, rx) = mpsc::unbounded_channel();
+    let acks = tx.clone();
+    let data = Channel::new(move |body| {
+        if let InvokeResponseBody::Raw(b) = body {
+            if b[0] == 1 {
+                *f.lock().unwrap() += 1;
+                let _ = acks.send(Input::Desktop(crate::desktop::Cmd::Ack(u32::from_le_bytes([b[1], b[2], b[3], b[4]]))));
+            }
+        }
+        Ok(())
+    });
+    let ctx = Ctx { store: Arc::new(Mutex::new(s)), prompts, events: events.into() };
+    let task = tokio::spawn(crate::rdp::run_session(ctx, id, 1024, 768, 100, data.into(), None, rx));
+    wait_for("frames through the tunnel", 30, || *frames.lock().unwrap() > 0).await;
+    assert!(log.lock().unwrap().iter().any(|e| e["message"].as_str().is_some_and(|m| m.starts_with("Tunnelling to"))));
+    tx.send(Input::Close).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+}
+
+// ---------- VNC ----------
+// Needs the TigerVNC container in src-tauri/tests/vnc: NIMBUS_TEST_VNC=<host> (ports 5901 with a
+// VNC password, 5902 with VeNCrypt and a certificate; password "nimbus-v").
+
+/// The VNC tests share one server, and one test changes which encodings Nimbus asks for.
+static VNC_SERVER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct Desk {
+    tx: mpsc::UnboundedSender<Input>,
+    canvas: Arc<Mutex<Canvas>>,
+    log: Arc<Mutex<Vec<Value>>>,
+    clipboard: Arc<MemClipboard>,
+    task: tokio::task::JoinHandle<()>,
+    store: Arc<Mutex<Store>>,
+}
+
+impl Desk {
+    fn state(&self) -> Option<String> {
+        self.log.lock().unwrap().iter().rev().find(|e| e["type"] == "status").map(|e| e["state"].as_str().unwrap_or("").to_string())
+    }
+
+    fn input(&self, evs: Vec<crate::desktop::Ev>) {
+        self.tx.send(Input::Desktop(crate::desktop::Cmd::Input(evs))).unwrap();
+    }
+
+    async fn close(self) -> Vec<Value> {
+        let _ = self.tx.send(Input::Close);
+        tokio::time::timeout(Duration::from_secs(10), self.task).await.unwrap().unwrap();
+        let log = self.log.lock().unwrap().clone();
+        log
+    }
+}
+
+/// Start a VNC session; prompts are answered from `answers` in order.
+fn vnc_session(addr: &str, port: u16, password: Option<&str>, answers: Vec<Value>, size: (u32, u32)) -> Desk {
+    let mut s = Store::open(temp_dir("vnc")).unwrap();
+    let id = new_id();
+    s.data.hosts.push(Host { id: id.clone(), label: "vnc".into(), protocol: "vnc".into(), address: addr.into(), port: Some(port), ..Default::default() });
+    if let Some(p) = password {
+        s.update_secret(&id, |sec| sec.password = Some(p.into()));
+    }
+    let store = Arc::new(Mutex::new(s));
+    let prompts = Arc::new(Prompts::default());
+    let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let answers = Arc::new(Mutex::new(VecDeque::from(answers)));
+    let (p, l) = (prompts.clone(), log.clone());
+    let events = Channel::<Value>::new(move |body| {
+        if let InvokeResponseBody::Json(s) = body {
+            let v: Value = serde_json::from_str(&s).unwrap();
+            if v["type"] == "prompt" {
+                p.reply(v["id"].as_str().unwrap(), answers.lock().unwrap().pop_front().unwrap_or(Value::Null));
+            }
+            l.lock().unwrap().push(v);
+        }
+        Ok(())
+    });
+    let (tx, rx) = mpsc::unbounded_channel();
+    let canvas = Arc::new(Mutex::new(Canvas::default()));
+    let (c, acks) = (canvas.clone(), tx.clone());
+    let data = Channel::new(move |body| {
+        if let InvokeResponseBody::Raw(b) = body {
+            if let Some(seq) = c.lock().unwrap().apply(&b) {
+                let _ = acks.send(Input::Desktop(crate::desktop::Cmd::Ack(seq)));
+            }
+        }
+        Ok(())
+    });
+    let clipboard = Arc::new(MemClipboard(Mutex::new(None), Mutex::new(vec![])));
+    let cb: Arc<dyn crate::desktop::Clipboard> = clipboard.clone();
+    let ctx = Ctx { store: store.clone(), prompts, events: events.into() };
+    let task = tokio::spawn(crate::vnc::run_session(ctx, id, size.0, size.1, data.into(), Some(cb), rx));
+    Desk { tx, canvas, log, clipboard, task, store }
+}
+
+fn vnc_exec(display: u8, cmd: &str) -> String {
+    let out = std::process::Command::new("docker")
+        .args(["exec", "-u", "tester", "-e", &format!("DISPLAY=:{display}"), "nimbus-vnc", "sh", "-c", cmd])
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vnc_every_encoding_draws_the_same_screen() {
+    let Ok(addr) = std::env::var("NIMBUS_TEST_VNC") else { return };
+    let _turn = VNC_SERVER.lock().await;
+    // A still screen to compare: the desktop at a fixed size, with nothing moving.
+    let run = |enc: Vec<i32>| {
+        let addr = addr.clone();
+        async move {
+            *crate::vnc::TEST_ENCODINGS.lock().unwrap() = Some(enc);
+            let d = vnc_session(&addr, 5901, Some("nimbus-v"), vec![], (1280, 800));
+            wait_for("the desktop", 20, || d.canvas.lock().unwrap().colours() > 20).await;
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let px = d.canvas.lock().unwrap().pixels.clone();
+            assert_eq!(d.state().as_deref(), Some("connected"));
+            d.close().await;
+            px
+        }
+    };
+    let raw = run(vec![0]).await;
+    for (name, enc) in [("Hextile", vec![5]), ("ZRLE", vec![16]), ("Tight", vec![7]), ("CopyRect+ZRLE", vec![1, 16])] {
+        let px = run(enc).await;
+        assert_eq!(px.len(), raw.len(), "{name}: different size");
+        // The clock may tick over, so allow a few pixels to differ.
+        let same = px.chunks_exact(4).zip(raw.chunks_exact(4)).filter(|(a, b)| a[..3] == b[..3]).count();
+        let pct = same * 100 / (px.len() / 4);
+        assert!(pct >= 99, "{name}: only {pct}% of pixels match Raw");
+    }
+    // JPEG is lossy: the picture is close, not exact.
+    let px = run(vec![7, -23]).await;
+    let close = px.chunks_exact(4).zip(raw.chunks_exact(4)).filter(|(a, b)| (0..3).all(|i| a[i].abs_diff(b[i]) < 40)).count();
+    assert!(close * 100 / (px.len() / 4) >= 97, "Tight JPEG differs too much");
+    *crate::vnc::TEST_ENCODINGS.lock().unwrap() = None;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vnc_session_resizes_types_and_shares_the_clipboard() {
+    let Ok(addr) = std::env::var("NIMBUS_TEST_VNC") else { return };
+    let _turn = VNC_SERVER.lock().await;
+    vnc_exec(1, "rm -f /tmp/typed-in-vnc");
+    // The tab is 1100×700: the remote desktop is resized to match.
+    let d = vnc_session(&addr, 5901, Some("nimbus-v"), vec![], (1100, 700));
+    wait_for("connected", 20, || d.state().as_deref() == Some("connected")).await;
+    wait_for("the resize", 20, || d.canvas.lock().unwrap().sizes.last() == Some(&(1100, 700))).await;
+    wait_for("the desktop", 20, || d.canvas.lock().unwrap().colours() > 20).await;
+    // Typing: Alt+F2 opens XFCE's run box; type a command and press Enter.
+    use crate::desktop::Ev;
+    // The remote's cursor shape arrives once the pointer is over the desktop.
+    d.input(vec![Ev::Move { x: 500, y: 400 }, Ev::Move { x: 520, y: 410 }]);
+    wait_for("the remote's cursor shape", 10, || d.canvas.lock().unwrap().pointers > 0).await;
+
+    let key = |k: u32, d: bool| Ev::Key { c: 0, e: false, d, k };
+    d.input(vec![key(0xffe9, true), key(0xffbf, true), key(0xffbf, false), key(0xffe9, false)]);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let mut evs = vec![];
+    for ch in "touch /tmp/typed-in-vnc".chars() {
+        evs.push(key(ch as u32, true));
+        evs.push(key(ch as u32, false));
+    }
+    evs.push(key(0xff0d, true));
+    evs.push(key(0xff0d, false));
+    d.input(evs);
+    wait_for("the typed command to run", 10, || vnc_exec(1, "ls /tmp/typed-in-vnc 2>/dev/null").contains("typed-in-vnc")).await;
+
+    // Copy on the remote → this computer (UTF-8, through the extended clipboard).
+    vnc_exec(1, "printf 'from the remote ✓' | timeout 8 xclip -selection clipboard >/dev/null 2>&1 &");
+    wait_for("the remote's clipboard", 10, || d.clipboard.1.lock().unwrap().iter().any(|t| t == "from the remote ✓")).await;
+    // This computer → paste on the remote.
+    *d.clipboard.0.lock().unwrap() = Some("from Nimbus ✓".into());
+    d.input(vec![Ev::Clipboard]);
+    wait_for("the remote to have our text", 10, || vnc_exec(1, "timeout 3 xclip -o -selection clipboard 2>/dev/null") == "from Nimbus ✓").await;
+
+    // Moving to another window: everything is sent again.
+    let sizes = d.canvas.lock().unwrap().sizes.len();
+    d.tx.send(Input::Desktop(crate::desktop::Cmd::Refresh)).unwrap();
+    wait_for("the refresh", 10, || d.canvas.lock().unwrap().sizes.len() > sizes).await;
+    let log = d.close().await;
+    assert_eq!(log.iter().rev().find(|e| e["type"] == "status").unwrap()["state"], "closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn vnc_vencrypt_checks_the_certificate_and_the_password() {
+    let Ok(addr) = std::env::var("NIMBUS_TEST_VNC") else { return };
+    let _turn = VNC_SERVER.lock().await;
+    // Refusing the certificate cancels.
+    let d = vnc_session(&addr, 5902, Some("nimbus-v"), vec![json!({ "accept": false })], (1024, 768));
+    let log = tokio::time::timeout(Duration::from_secs(20), async {
+        while !matches!(d.state().as_deref(), Some("error" | "closed")) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        d.log.lock().unwrap().clone()
+    })
+    .await
+    .unwrap();
+    let last = log.iter().rev().find(|e| e["type"] == "status").unwrap();
+    assert!(last["message"].as_str().unwrap().contains("not trusted"), "{last}");
+
+    // Trusted, a wrong saved password, then the right one when asked: connected, encrypted.
+    let d = vnc_session(&addr, 5902, Some("wrong"), vec![json!({ "accept": true }), json!({ "value": "nimbus-v", "save": true })], (1024, 768));
+    wait_for("connected", 30, || matches!(d.state().as_deref(), Some("connected" | "error"))).await;
+    assert_eq!(d.state().as_deref(), Some("connected"), "{:?}", d.log.lock().unwrap());
+    wait_for("the desktop", 20, || d.canvas.lock().unwrap().colours() > 20).await;
+    let store = d.store.clone();
+    let log = d.close().await;
+    assert!(log.iter().any(|e| e["kind"] == "password"), "should have asked for the password again");
+    assert!(store.lock().unwrap().known_host(&format!("vnc://{addr}:5902")).is_some());
+    let id = store.lock().unwrap().data.hosts[0].id.clone();
+    assert_eq!(store.lock().unwrap().secret(&id).password.as_deref(), Some("nimbus-v"), "the corrected password is saved");
+}

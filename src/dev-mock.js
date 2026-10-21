@@ -2,6 +2,7 @@
 // Fakes the Rust backend in memory so the UI can be clicked through and styled.
 // Never included in a production build.
 import { mockIPC } from '@tauri-apps/api/mocks';
+import pkg from '../package.json';
 
 const id = () => crypto.randomUUID();
 const g1 = id(), g2 = id(), g3 = id(), k1 = id();
@@ -15,17 +16,17 @@ const data = {
   hosts: [
     ['web-01', '10.0.1.11', g1], ['web-02', '10.0.1.12', g1], ['db-primary', '10.0.2.5', g1],
     ['Raspberry Pi', '192.168.1.40', g2], ['NAS', '192.168.1.10', g2],
-    ['Bastion', 'bastion.example.com', null], ['Local test server', '127.0.0.1', null], ['Media FTP', 'nas.local', g2, 'ftps'], ['Core switch console', '/dev/cu.usbserial-A10K3', null, 'serial'],
-  ].map(([label, address, groupId, protocol = 'ssh']) => ({ id: id(), label, address, groupId, protocol, useAgent: true, tags: [], port: label === 'Bastion' ? 2022 : null, username: label === 'Bastion' ? 'ben' : null })),
+    ['Bastion', 'bastion.example.com', null], ['Local test server', '127.0.0.1', null], ['Media FTP', 'nas.local', g2, 'ftps'], ['Core switch console', '/dev/cu.usbserial-A10K3', null, 'serial'], ['Office PC', 'office-pc.corp.local', g2, 'rdp'], ['Studio Mac', 'studio.local', null, 'vnc'],
+  ].map(([label, address, groupId, protocol = 'ssh']) => ({ id: id(), label, address, groupId, protocol, useAgent: true, tags: [], port: label === 'Bastion' ? 2022 : null, username: label === 'Bastion' ? 'alex' : null })),
   keys: [{ id: k1, label: 'Laptop ed25519', keyType: 'ssh-ed25519', publicKey: 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExampleOnlyExampleOnlyExampleOnly0000 laptop', fingerprint: 'SHA256:3fq0Wl3JmX2b8yXkq1m7ZJbq0vJgGg3m4zU9bq2gXyE', encrypted: false }],
   snippets: [
     { id: id(), name: 'Disk usage', command: 'df -h', run: true },
     { id: id(), name: 'Follow syslog', command: 'sudo journalctl -f', run: false },
   ],
   passwords: [
-    { id: 'pw1', name: 'Ubuntu sudo', groupId: 'pg1', username: 'ben', url: null, notes: null, updated: Date.now() - 86400000 },
+    { id: 'pw1', name: 'Ubuntu sudo', groupId: 'pg1', username: 'alex', url: null, notes: null, updated: Date.now() - 86400000 },
     { id: 'pw2', name: 'Router admin', groupId: 'pg2', username: 'admin', url: '192.168.1.1', notes: 'Upstairs closet', updated: Date.now() - 86400000 * 9 },
-    { id: 'pw3', name: 'GitHub', username: 'ben@example.com', url: 'github.com', notes: null, updated: Date.now() - 86400000 * 30 },
+    { id: 'pw3', name: 'GitHub', username: 'alex@example.com', url: 'github.com', notes: null, updated: Date.now() - 86400000 * 30 },
     { id: 'pw4', name: 'Proxmox', groupId: 'pg1', username: 'root', url: 'https://pve.local:8006', notes: null, updated: Date.now() - 86400000 * 2 },
   ],
   passwordGroups: [{ id: 'pg1', name: 'Servers', color: '#34c77b' }, { id: 'pg2', name: 'Network gear', color: '#f59e0b' }],
@@ -58,7 +59,7 @@ const mcpLog = [
 const now = Date.now();
 const tree = (o) => Object.entries(o).map(([name, v]) => (typeof v === 'number' ? { name, size: v, modified: now - v * 1000 } : { name, children: tree(v), modified: now - 86400000 }));
 const fsys = {
-  local: { sep: '/', home: '/Users/ben', root: { name: '', children: tree({ Users: { ben: { Documents: { 'notes.md': 2400, 'budget.xlsx': 48211 }, Downloads: { 'ubuntu-24.04.iso': 2700000000, 'photo.jpg': 3400000 }, Desktop: {}, '.zshrc': 900, 'deploy.sh': 1200 } } }) } },
+  local: { sep: '/', home: '/Users/alex', root: { name: '', children: tree({ Users: { alex: { Documents: { 'notes.md': 2400, 'budget.xlsx': 48211 }, Downloads: { 'ubuntu-24.04.iso': 2700000000, 'photo.jpg': 3400000 }, Desktop: {}, '.zshrc': 900, 'deploy.sh': 1200 } } }) } },
   remote: { sep: '/', home: '/home/deploy', root: { name: '', children: tree({ etc: { nginx: { 'nginx.conf': 2600 }, hosts: 220 }, var: { log: { 'syslog': 880000, 'auth.log': 120000 } }, home: { deploy: { apps: { api: { 'server.js': 5300 } }, backups: { 'db-2024-10-01.sql.gz': 98000000 }, '.bashrc': 3700, 'docker-compose.yml': 1400, 'notes.txt': 310 } } }) } },
 };
 const fsFor = (sid) => (sid === 'local' ? fsys.local : fsys.remote);
@@ -100,17 +101,53 @@ function fakeTransfer(sid, tid, upload, items, dest) {
   }, 120);
 }
 const cancelled = new Set();
-const snap = () => ({ data: structuredClone(data), secrets: structuredClone(secrets), vaultMode: 'keychain', dataDir: '~/Library/Application Support/app.nimbus.ssh', warning: null, platform: 'macos', version: '0.1.0' });
+const snap = () => ({ data: structuredClone(data), secrets: structuredClone(secrets), vaultMode: 'keychain', dataDir: '~/Library/Application Support/app.nimbus.ssh', warning: null, platform: 'macos', version: pkg.version });
 const upsert = (list, item) => { const i = list.findIndex((x) => x.id === item.id); i < 0 ? list.push(item) : (list[i] = item); };
 
 const prompts = new Map();
 const sessions = new Map();
 
+// A pretend remote desktop: a wallpaper and a window, redrawn at whatever size the tab asks for.
+const rdpScreens = new Map();
+function fakeDesktop(sid, w, h, events, out) {
+  const ev = (m) => events.onmessage(m);
+  const draw = (w, h) => {
+    w = Math.min(w, 4000) & ~1; h = Math.min(h, 3000);
+    const size = new Uint8Array([2, w & 255, w >> 8, h & 255, h >> 8]);
+    out.onmessage(size.buffer);
+    const c = new OffscreenCanvas(w, h);
+    const g = c.getContext('2d');
+    const grad = g.createLinearGradient(0, 0, w, h);
+    grad.addColorStop(0, '#0b3d91'); grad.addColorStop(1, '#2a8bd8');
+    g.fillStyle = grad; g.fillRect(0, 0, w, h);
+    g.fillStyle = '#f3f3f3'; g.fillRect(w * 0.18, h * 0.16, w * 0.5, h * 0.55);
+    g.fillStyle = '#fff'; g.fillRect(w * 0.18, h * 0.16, w * 0.5, 32);
+    g.fillStyle = '#222'; g.font = '15px sans-serif'; g.fillText('Remote window', w * 0.18 + 12, h * 0.16 + 21);
+    g.fillStyle = '#1b1b1b'; g.fillRect(0, h - 44, w, 44);
+    const px = g.getImageData(0, 0, w, h).data;
+    const msg = new Uint8Array(7 + 8 + px.length);
+    const v = new DataView(msg.buffer);
+    v.setUint8(0, 1); v.setUint32(1, 1, true); v.setUint16(5, 1, true);
+    v.setUint16(7, 0, true); v.setUint16(9, 0, true); v.setUint16(11, w, true); v.setUint16(13, h, true);
+    msg.set(px, 15);
+    out.onmessage(msg.buffer);
+  };
+  rdpScreens.set(sid, draw);
+  (async () => {
+    ev({ type: 'status', state: 'connecting', message: 'Connecting to office-pc.corp.local:3389…' });
+    await new Promise((r) => setTimeout(r, 400));
+    ev({ type: 'status', state: 'authenticating', message: 'Signing in…' });
+    await new Promise((r) => setTimeout(r, 300));
+    ev({ type: 'status', state: 'connected', message: '' });
+    draw(w, h);
+  })();
+}
+
 function fakeSession(sid, hostId, events, out) {
   const host = data.hosts.find((h) => h.id === hostId);
   const ev = (m) => events.onmessage(m);
   const write = (s) => out.onmessage(new TextEncoder().encode(s).buffer);
-  const user = host.username || data.groups.find((g) => g.id === host.groupId)?.username || 'ben';
+  const user = host.username || data.groups.find((g) => g.id === host.groupId)?.username || 'alex';
   const ask = (kind, d) => new Promise((res) => { const pid = id(); prompts.set(pid, res); ev({ type: 'prompt', id: pid, kind, data: d }); });
   (async () => {
     ev({ type: 'status', state: 'connecting', message: `Connecting to ${host.address}:${host.port || 22}…` });
@@ -205,6 +242,10 @@ mockIPC(
       case 'plugin:opener|open_url': console.info('[mock] open', a.url); return null;
       case 'import_ssh_config': return { report: { hostsAdded: 0, hostsSkipped: 2, keysAdded: 0, warnings: [] }, state: snap() };
       case 'ssh_connect': fakeSession(a.sessionId, a.hostId, a.events, a.data); return null;
+      case 'rdp_connect': fakeDesktop(a.sessionId, a.width, a.height, a.events, a.data); return null;
+      case 'vnc_connect': fakeDesktop(a.sessionId, a.width, a.height, a.events, a.data); return null;
+      case 'desktop_resize': rdpScreens.get(a.sessionId)?.(a.width, a.height); return null;
+      case 'desktop_input': case 'desktop_ack': case 'desktop_type_password': return null;
       case 'ssh_write': sessions.get(a.sessionId)?.(a.data); return null;
       case 'ssh_resize': case 'ssh_close': return null;
       case 'ssh_break': sessions.get(a.sessionId)?.('\x03'); return null;

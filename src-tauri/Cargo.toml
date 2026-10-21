@@ -1,6 +1,6 @@
 [package]
 name = "nimbus"
-version = "0.5.0"
+version = "0.6.0"
 description = "Nimbus - a simple, local-only SSH connection manager"
 edition = "2021"
 
@@ -18,15 +18,33 @@ strip = true
 tauri-build = { version = "2.7.3", features = [] }
 
 [dependencies]
+aes = "0.8"
 aes-gcm = "0.11.1"
 anyhow = "1.0.104"
 base64 = "0.23.1"
+des = "0.8"
 dirs = "7.0.0"
+flate2 = "1.1.10"
 getrandom = "0.4.3"
 http-body-util = "0.1.5"
 hyper = { version = "1.12.0", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
+# Remote Desktop. Pinned to an IronRDP commit until a crates.io release uses sspi 0.23 (the
+# released one pins pre-release crypto crates that clash with russh's).
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.7.0" }
+ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.10.0" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.2.1" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.8.0" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.8.0" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.9.0" }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.9.0" }
+ironrdp-session = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.11.0" }
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.8.0" }
+ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "d4c2fec3460bcb44a8a66712f179282e4f3dc762", version = "0.10.0" }
+jpeg-decoder = { version = "0.3", default-features = false }
 keyring = "4.2.0"
+md-5 = "0.10"
+num-bigint = "0.4"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "charset"] }
 russh = { version = "0.64.1", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3.0.1"
@@ -45,9 +63,11 @@ tokio = { version = "1.53.3", features = ["full"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "logging", "tls12"] }
 trash = "5.2.9"
 uuid = { version = "1.28.0", features = ["v4"] }
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 async-trait = "0.1.92"
 libunftp = { version = "0.23.1", default-features = false, features = ["ring"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unftp-core = "0.1.0"
 unftp-sbe-fs = "0.4.0"

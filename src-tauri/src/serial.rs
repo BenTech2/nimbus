@@ -185,7 +185,7 @@ async fn serial_inner(
                         let _ = data.send(InvokeResponseBody::Raw(format!("\r\n[Nimbus: couldn't send a break: {e}]\r\n").into_bytes()));
                     }
                 }
-                Some(Input::Resize(..)) => {}
+                Some(Input::Resize(..)) | Some(Input::Desktop(_)) => {}
                 Some(Input::Close) | None => break Ok("Port closed".to_string()),
             },
         }

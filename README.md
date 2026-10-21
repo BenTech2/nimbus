@@ -2,9 +2,9 @@
 
 ![Nimbus showing hosts grouped into Home lab, Production and No group](docs/screenshot.png)
 
-A simple SSH, SFTP, FTP and serial connection manager, with no cloud, accounts or vault
-service. Your hosts live on your computer, and you move them to another computer with one
-export file.
+A simple SSH, SFTP, FTP, serial, Remote Desktop and VNC connection manager, with no cloud,
+accounts or vault service. Your hosts live on your computer, and you move them to another
+computer with one export file.
 
 Runs natively on **macOS, Windows and Linux** (Tauri: Rust core + the OS's own webview,
 ~10–15 MB installers).
@@ -21,8 +21,28 @@ Runs natively on **macOS, Windows and Linux** (Tauri: Rust core + the OS's own w
   parity, stop bits and flow control, what Enter sends (CR / LF / CR LF) and local echo. It opens
   in a terminal tab with a **Break** button; Snippets and Type password work there too.
   On Linux your user needs to be in the `dialout` group to open serial ports.
+- **Remote Desktop (RDP)**: add a host of type RDP for a Windows PC or server, or a Linux desktop
+  running xrdp. It opens in a tab like any other connection (and can be pulled out into its own
+  window). The remote desktop is resized to fit the tab whenever the window changes size, at
+  your screen's full resolution so text stays sharp on Retina / HiDPI displays (turn that off per
+  host for slow connections). Sign-in uses Network Level Authentication with the host's saved
+  password, and the server's certificate is checked like an SSH host key: trusted the first time,
+  flagged if it changes. Text copy and paste works both ways. Rest the pointer at the top edge
+  for the toolbar: Ctrl+Alt+Del, the Start key, Type password, full screen and disconnect. On a
+  Mac, ⌘ works as Ctrl (⌘C / ⌘V / ⌘Z). Jump hosts work, so a desktop behind a bastion is one
+  click. Built on [IronRDP](https://github.com/Devolutions/IronRDP).
+- **VNC (screen sharing)**: add a host of type VNC for a Mac (turn on Screen Sharing), a Linux
+  desktop (TigerVNC, x11vnc, wayvnc), a Raspberry Pi, or a virtual machine's console (Proxmox,
+  QEMU). It works like a Remote Desktop tab: the same toolbar, Type password, copy and paste
+  (accents and emoji too, with servers that support the extended clipboard), tabs that move
+  between windows. The remote desktop is resized to fit the tab when the server allows it
+  (TigerVNC does); otherwise the picture is scaled to fit. Sign-in, best first: VeNCrypt with a
+  certificate (encrypted; the certificate is checked like an SSH host key), Apple's sign-in for a
+  Mac (user name and password, sent encrypted), or the classic VNC password. Plain VNC isn't
+  encrypted, so on untrusted networks connect through a jump host.
 - **Quick connect**: type `user@host` or `user@host:port` in the search box and press Enter.
-  Start with `sftp://`, `ftp://` or `ftps://` to open the file browser instead.
+  Start with `sftp://`, `ftp://` or `ftps://` to open the file browser instead, or `rdp://` /
+  `vnc://` for a remote desktop.
 - **Light and dark themes**: follow the system, or pick one in Settings.
 - **Tabs**: many sessions at once. ⌘T home, ⌘W close tab, ⌘1–9 switch, ⌘D duplicate,
   Ctrl+Tab cycle (on Windows and Linux use Ctrl+Shift instead of ⌘). Drag a tab along the tab
@@ -173,6 +193,11 @@ inside the test. The SSH and SFTP tests run against a real `sshd` on 127.0.0.1:2
 cd src-tauri && NIMBUS_TEST_SSHD=/path/to/keys cargo test
 ```
 
+The Remote Desktop tests run against the xrdp container in `src-tauri/tests/xrdp` (see the top of
+its Dockerfile) when `NIMBUS_TEST_RDP=127.0.0.1:3390` is set; with `NIMBUS_TEST_SSHD` too, they
+also connect through the SSH test server as a jump host. The VNC tests run against the TigerVNC
+container in `src-tauri/tests/vnc` when `NIMBUS_TEST_VNC=127.0.0.1` is set.
+
 The agent `sudo` test also needs a second sshd on 127.0.0.1:2223 whose `PATH` starts with a fake
 `sudo` that accepts `hunter2-sudo` (`SetEnv PATH=...` in its config); set `NIMBUS_TEST_SUDO=1`.
 
@@ -183,12 +208,16 @@ src/                 UI (vanilla JS + xterm.js)
   main.js            views, editors, tabs, shortcuts
   terminal.js        one terminal tab ↔ one SSH session (tabs can move between windows)
   files.js           one file browser tab (local pane + SFTP/FTP pane, transfers)
+  desktop.js         one Remote Desktop or VNC tab (canvas, keyboard and mouse, toolbar)
   prompts.js         host-key / password / 2FA dialogs
 src-tauri/src/       Rust core
   ssh.rs             connect, host-key check, auth, jump hosts, PTY pump (russh)
   files.rs           local disk, SFTP and FTP/FTPS browsing and transfers
   mcp.rs             AI agent (MCP) server, approvals, stdio bridge
   serial.rs          serial port sessions
+  desktop.rs         what Remote Desktop and VNC share: streaming the screen, input, tunnels
+  rdp.rs             Remote Desktop sessions (IronRDP): sign-in, screen updates, resize, clipboard
+  vnc.rs             VNC sessions: sign-in, the decoders (Tight, ZRLE, Hextile…), resize, clipboard
 src/apikeys.js       API credential types and "Copy as" formats
 docker/, scripts/    the Linux ARM64 build
   store.rs           data model + persistence
@@ -200,8 +229,8 @@ docker/, scripts/    the Linux ARM64 build
 
 ## Not yet
 
-- **RDP.** Hosts already carry a `protocol` field so RDP entries can sit in the same
-  list and groups. Planned first step: an "RDP" host type that opens the system's RDP client
-  (Windows App on macOS, `mstsc` on Windows, Remmina/xfreerdp on Linux) with the saved
-  address and username. An embedded RDP view (e.g. via IronRDP) would come after.
+- Remote Desktop: sound, drive and printer redirection, multiple monitors, RD Gateway, and the
+  H.264 graphics pipeline (screen updates use RemoteFX and bitmap codecs today).
+- VNC: newer macOS sign-in types (when the Mac offers only those), anonymous-TLS VeNCrypt,
+  file transfer, sound.
 - Port forwarding, agent forwarding, split panes, editing a remote file in place.

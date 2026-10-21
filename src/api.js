@@ -82,6 +82,28 @@ export const api = {
     return invoke('ssh_connect', { sessionId, hostId, cols, rows, events, data });
   },
   write: (sessionId, data) => invoke('ssh_write', { sessionId, data }),
+
+  // Remote Desktop tab. Width and height are device pixels; scale is the display scale (100 = 100%).
+  rdpConnect(sessionId, hostId, width, height, scale, onEvent, onData) {
+    const events = new Channel();
+    events.onmessage = onEvent;
+    const data = new Channel();
+    data.onmessage = onData;
+    return invoke('rdp_connect', { sessionId, hostId, width, height, scale, events, data });
+  },
+  // VNC tab: the size is what the remote desktop should be, if the server can resize it.
+  vncConnect(sessionId, hostId, width, height, _scale, onEvent, onData) {
+    const events = new Channel();
+    events.onmessage = onEvent;
+    const data = new Channel();
+    data.onmessage = onData;
+    return invoke('vnc_connect', { sessionId, hostId, width, height, events, data });
+  },
+  // Both kinds of desktop tab.
+  desktopInput: (sessionId, events) => invoke('desktop_input', { sessionId, events }),
+  desktopResize: (sessionId, width, height, scale) => invoke('desktop_resize', { sessionId, width, height, scale }),
+  desktopAck: (sessionId, seq) => invoke('desktop_ack', { sessionId, seq }),
+  desktopTypePassword: (sessionId, secretId) => invoke('desktop_type_password', { sessionId, secretId }),
   resize: (sessionId, cols, rows) => invoke('ssh_resize', { sessionId, cols, rows }),
   sendBreak: (sessionId) => invoke('ssh_break', { sessionId }),
   serialPorts: () => invoke('serial_ports'),

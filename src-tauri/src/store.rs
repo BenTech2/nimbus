@@ -30,7 +30,7 @@ pub struct Group {
 pub struct Host {
     pub id: String,
     pub label: String,
-    /// "ssh", "serial", "ftp" or "ftps" (FTP with explicit TLS). "rdp" is reserved for later.
+    /// "ssh", "serial", "ftp", "ftps" (FTP with explicit TLS), "rdp" (Remote Desktop) or "vnc".
     pub protocol: String,
     /// For SSH/FTP the host name or IP; for serial the port (e.g. /dev/cu.usbserial-10, COM3).
     pub address: String,
@@ -56,11 +56,26 @@ pub struct Host {
     pub newline: Option<String>,
     /// Show typed characters locally, for devices that don't echo.
     pub local_echo: bool,
+    // Remote Desktop and VNC (the domain is Remote Desktop only).
+    /// Windows domain; "DOMAIN\\user" in the username works too.
+    pub domain: Option<String>,
+    /// Copy and paste text between this computer and the remote desktop.
+    pub share_clipboard: bool,
+    /// Render at the screen's full resolution (sharp on Retina / HiDPI, but more to send).
+    pub rdp_hidpi: bool,
 }
 
 impl Host {
     pub fn is_ssh(&self) -> bool {
-        !matches!(self.protocol.as_str(), "ftp" | "ftps" | "serial")
+        !matches!(self.protocol.as_str(), "ftp" | "ftps" | "serial" | "rdp" | "vnc")
+    }
+
+    pub fn is_vnc(&self) -> bool {
+        self.protocol == "vnc"
+    }
+
+    pub fn is_rdp(&self) -> bool {
+        self.protocol == "rdp"
     }
 
     pub fn is_serial(&self) -> bool {
@@ -92,6 +107,9 @@ impl Default for Host {
             flow_control: None,
             newline: None,
             local_echo: false,
+            domain: None,
+            share_clipboard: true,
+            rdp_hidpi: true,
         }
     }
 }

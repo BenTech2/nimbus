@@ -563,3 +563,27 @@ body.tab-drop-target #titlebar { background: color-mix(in srgb, var(--accent) 16
 body.tab-drop-target #tabs::after { content: 'Drop to add the tab here'; align-self: center; margin-left: 8px; font-size: 12px; color: var(--accent); white-space: nowrap; }
 /* A window holding tabs dragged out of the main one: just the tabs, no home screen. */
 body.tab-window #home { display: none !important; }
+
+/* ---------- Remote Desktop tab ---------- */
+.segmented.six { grid-auto-flow: row; grid-template-columns: repeat(3, 1fr); }
+.segmented.six label { padding: 6px 2px; }
+.rdp-host { flex: 1; min-height: 0; position: relative; overflow: hidden; background: #000; display: flex; align-items: center; justify-content: center; }
+.rdp-screen { display: block; outline: none; touch-action: none; flex-shrink: 0; }
+.rdp-pane.ended .rdp-screen { filter: grayscale(0.6) brightness(0.55); transition: filter 0.3s; }
+/* Rest the pointer at the top edge to bring down the toolbar. */
+.rdp-reveal { position: absolute; top: 0; left: 25%; right: 25%; height: 6px; z-index: 7; }
+.rdp-bar {
+  position: absolute; top: 0; left: 50%; z-index: 8;
+  display: flex; align-items: center; gap: 6px;
+  padding: 6px 8px; border-radius: 0 0 12px 12px;
+  background: var(--glass); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border-strong); border-top: 0;
+  box-shadow: 0 8px 24px var(--shadow);
+  transform: translate(-50%, -110%); transition: transform 0.18s ease;
+}
+.rdp-bar.shown { transform: translate(-50%, 0); }
+.rdp-bar .rdp-name { font-weight: 600; font-size: 12.5px; padding: 0 6px 0 4px; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rdp-bar .btn svg { width: 13px; height: 13px; }
+.rdp-pop { top: 52px; right: auto; left: 50%; transform: translateX(-50%); z-index: 9; }
+body.rdp-fullscreen #titlebar { display: none; }
+body.rdp-fullscreen #body { height: 100%; }

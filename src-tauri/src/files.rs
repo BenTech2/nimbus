@@ -258,14 +258,28 @@ impl rustls::client::danger::ServerCertVerifier for TofuVerifier {
 }
 
 fn tls_connector(trusted: Option<String>, rejected: Arc<Mutex<Option<String>>>) -> anyhow::Result<AsyncRustlsConnector> {
+    let config = tofu_tls_config(trusted, rejected, false)?;
+    Ok(AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(Arc::new(config))))
+}
+
+/// TLS that trusts what the system trusts, or the one certificate the user trusted before.
+/// `no_resumption` for Remote Desktop, whose sign-in (CredSSP) can't use resumed sessions.
+pub(crate) fn tofu_tls_config(
+    trusted: Option<String>,
+    rejected: Arc<Mutex<Option<String>>>,
+    no_resumption: bool,
+) -> anyhow::Result<rustls::ClientConfig> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let inner = Arc::new(rustls_platform_verifier::Verifier::new(provider.clone())?);
-    let config = rustls::ClientConfig::builder_with_provider(provider)
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()?
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(TofuVerifier { inner, trusted, rejected }))
         .with_no_client_auth();
-    Ok(AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(Arc::new(config))))
+    if no_resumption {
+        config.resumption = rustls::client::Resumption::disabled();
+    }
+    Ok(config)
 }
 
 // ---------- FTP connections ----------
@@ -490,6 +504,9 @@ pub async fn connect(ctx: &Ctx, host_id: &str) -> anyhow::Result<(Remote, String
     let host = ctx.store.lock().unwrap().effective_host(host_id).ok_or_else(|| anyhow!("This host no longer exists"))?;
     if host.is_serial() {
         bail!("“{}” is a serial device, which has no files to browse", ssh::display_name(&host));
+    }
+    if host.is_rdp() || host.is_vnc() {
+        bail!("“{}” is a remote desktop. Open it to use its screen.", ssh::display_name(&host));
     }
     if host.address.trim().is_empty() {
         bail!("“{}” has no address", ssh::display_name(&host));

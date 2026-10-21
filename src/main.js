@@ -9,6 +9,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { api } from './api.js';
 import { COLORS, confirmDialog, contextMenu, esc, icon, initials, modal, modalOpen, timeAgo, toast, uid } from './ui.js';
 import { TermSession } from './terminal.js';
+import { DesktopSession } from './desktop.js';
 import { FileSession, listenForFileDrops, protocolLabel } from './files.js';
 import logoUrl from './assets/logo.svg';
 import { API_KINDS, ENVIRONMENTS, buildCopy, copyFormats, envColor, expiryInfo, identity, primaryField } from './apikeys.js';
@@ -60,10 +61,11 @@ const app = {
   modalOpen,
 
   // --- sessions ---
-  /** Open a host: a terminal for SSH hosts, the file browser for FTP hosts. */
+  /** Open a host: a terminal for SSH hosts, the desktop for RDP, the file browser for FTP. */
   connect(hostId) {
     const host = this.host(hostId);
     if (!host) return;
+    if (isRdp(host) || isVnc(host)) return this.open(new DesktopSession(this, host));
     if (!isSsh(host) && !isSerial(host)) return this.openFiles(hostId);
     this.open(new TermSession(this, host));
   },
@@ -108,8 +110,8 @@ const app = {
   async adoptTab(sid, index = this.sessions.length) {
     try {
       const p = await api.tabClaim(sid);
-      const host = this.host(p.hostId) || { id: p.hostId, label: p.label, address: '', protocol: p.kind === 'files' ? 'ftp' : 'ssh' };
-      const s = p.kind === 'files' ? new FileSession(this, host, { adopting: true }) : new TermSession(this, host);
+      const host = this.host(p.hostId) || { id: p.hostId, label: p.label, address: '', protocol: { files: 'ftp', rdp: 'rdp', vnc: 'vnc' }[p.kind] || 'ssh' };
+      const s = p.kind === 'files' ? new FileSession(this, host, { adopting: true }) : p.kind === 'rdp' || p.kind === 'vnc' ? new DesktopSession(this, host) : new TermSession(this, host);
       this.sessions.splice(Math.min(index, this.sessions.length), 0, s);
       this.activate(s);
       await s.adoptFrom(p);
@@ -168,12 +170,14 @@ const app = {
   },
 };
 
-const isSsh = (h) => !['ftp', 'ftps', 'serial'].includes(h.protocol);
+const isSsh = (h) => !['ftp', 'ftps', 'serial', 'rdp', 'vnc'].includes(h.protocol);
 const isSerial = (h) => h.protocol === 'serial';
+const isRdp = (h) => h.protocol === 'rdp';
+const isVnc = (h) => h.protocol === 'vnc';
 const BAUDS = [300, 1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200, 230400, 460800, 921600];
 /** "115200 8N1" style summary of a serial host's line settings. */
 const serialSummary = (h) => `${h.baudRate || 9600} ${h.dataBits || 8}${{ odd: 'O', even: 'E' }[h.parity] || 'N'}${h.stopBits || 1}`;
-const defaultPort = (h) => (isSsh(h) ? 22 : 21);
+const defaultPort = (h) => (isSsh(h) ? 22 : isRdp(h) ? 3389 : isVnc(h) ? 5900 : 21);
 
 const byName = (a, b) => (a.label || a.name || '').localeCompare(b.label || b.name || '', undefined, { sensitivity: 'base', numeric: true });
 
@@ -222,7 +226,7 @@ function renderTabs() {
       .map((s, i) => {
         const h = app.host(s.hostId);
         const label = h ? h.label || h.address : s.label;
-        const kind = s.kind === 'files' ? `<span class="kind">${protocolLabel(h)}</span>` : '';
+        const kind = s.kind === 'files' ? `<span class="kind">${protocolLabel(h)}</span>` : s.kind === 'rdp' || s.kind === 'vnc' ? `<span class="kind">${s.kind.toUpperCase()}</span>` : '';
         return `<button class="tab ${app.active === s ? 'active' : ''} ${tabDrag.s === s ? 'drag-src' : ''}" data-tab="${i}" title="${esc(label)}">
           <span class="dot ${s.state}"></span><span class="label">${esc(label)}</span>${kind}
           <span class="close" data-close="${i}" role="button" aria-label="Close tab">${icon.x}</span></button>`;
@@ -521,7 +525,7 @@ function hostsBlock(hosts, { showGroup = false, sections = false } = {}) {
 }
 
 // [ssh|sftp|ftp|ftps://][user@]host[:port]
-const QUICK = /^(?:(ssh|sftp|ftps?):\/\/)?(?:([^@\s/]+)@)?(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5}))?\/?$/i;
+const QUICK = /^(?:(ssh|sftp|ftps?|rdp|vnc):\/\/)?(?:([^@\s/]+)@)?(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9._-]+)(?::(\d{1,5}))?\/?$/i;
 
 function searchMatches() {
   const q = app.search.trim().toLowerCase();
@@ -1206,13 +1210,13 @@ content.addEventListener('keydown', async (e) => {
   if (hits.length === 1 && !q.includes('@')) return app.connect(hits[0].id);
   if (!quick) return;
   const [, scheme = 'ssh', user, addr, port] = quick;
-  const protocol = { ssh: 'ssh', sftp: 'ssh', ftp: 'ftp', ftps: 'ftps' }[scheme.toLowerCase()];
+  const protocol = { ssh: 'ssh', sftp: 'ssh', ftp: 'ftp', ftps: 'ftps', rdp: 'rdp', vnc: 'vnc' }[scheme.toLowerCase()];
   const files = scheme.toLowerCase() === 'sftp';
   const address = addr.replace(/^\[|\]$/g, '');
   const go = (id) => (files ? app.openFiles(id) : app.connect(id));
   const existing = app.data().hosts.find((h) => h.address === address && (h.protocol || 'ssh') === protocol && (!user || h.username === user) && (!port || h.port === +port));
   if (existing) return go(existing.id);
-  const host = { id: uid(), label: address, protocol, address, username: user || null, port: port ? +port : null, useAgent: true, tags: [] };
+  const host = { id: uid(), label: address, protocol, address, username: user || null, port: port ? +port : null, useAgent: protocol === 'ssh', tags: [], ...(protocol === 'vnc' ? { rdpHidpi: false } : {}) };
   if (await run(() => api.saveHost(host, null))) {
     app.search = '';
     renderContent();
@@ -1271,7 +1275,7 @@ content.addEventListener('contextmenu', (e) => {
     const id = card.dataset.host;
     const h = app.host(id);
     contextMenu(e.clientX, e.clientY, [
-      { label: isSsh(h) ? 'Connect' : 'Open files', icon: isSsh(h) ? icon.play : icon.folder, action: () => app.connect(id) },
+      { label: isSsh(h) || isRdp(h) || isVnc(h) ? 'Connect' : 'Open files', icon: isRdp(h) || isVnc(h) ? icon.monitor : isSsh(h) ? icon.play : icon.folder, action: () => app.connect(id) },
       ...(isSsh(h) ? [{ label: 'Open SFTP', icon: icon.folder, action: () => app.openFiles(id) }] : []),
       { label: 'Edit', icon: icon.edit, action: () => openDrawer('host', id) },
       { label: 'Duplicate', icon: icon.copy, action: () => run(() => api.duplicateHost(id)) },
@@ -1497,7 +1501,9 @@ function hostForm(id) {
   return drawerShell(
     id ? 'Edit host' : 'New host',
     `<div class="fieldset"><div class="legend">Connection</div>
-      <div class="segmented four">${protoOpt('ssh', 'SSH', 'Terminal + SFTP')}${protoOpt('serial', 'Serial', 'USB / COM')}${protoOpt('ftp', 'FTP', 'Files')}${protoOpt('ftps', 'FTPS', 'Encrypted')}</div>
+      <div class="segmented six">${protoOpt('ssh', 'SSH', 'Terminal + SFTP')}${protoOpt('rdp', 'RDP', 'Windows desktop')}${protoOpt('vnc', 'VNC', 'Mac / Linux / VM')}${protoOpt('serial', 'Serial', 'USB / COM')}${protoOpt('ftp', 'FTP', 'Files')}${protoOpt('ftps', 'FTPS', 'Encrypted files')}</div>
+      <p class="hint proto-hint" data-for="rdp">Remote Desktop: a Windows PC or server, or a Linux desktop running xrdp. The desktop resizes to fit the tab.</p>
+      <p class="hint proto-hint" data-for="vnc">Screen sharing: a Mac (turn on Screen Sharing), a Linux desktop (TigerVNC, x11vnc, wayvnc), a Raspberry Pi, or a virtual machine's console. Plain VNC isn't encrypted, so use a jump host on networks you don't trust.</p>
       <p class="hint proto-hint" data-for="serial">A device on a serial port: a router or switch console cable, an Arduino, a USB-serial adapter.</p>
       <p class="hint proto-hint" data-for="ftp">Plain FTP sends your password and files unencrypted. Use FTPS, or SSH (SFTP), when the server supports it.</p>
       <p class="hint proto-hint" data-for="ftps">FTP with TLS (“explicit FTPS”). If the server's certificate isn't from a known authority, you'll be asked to trust it once.</p>
@@ -1505,7 +1511,7 @@ function hostForm(id) {
     <div class="fieldset"><div class="legend">Address</div>
       <label class="field"><span>Label</span><input name="label" value="${esc(h.label)}" placeholder="e.g. Web server" autofocus></label>
       <div class="field-row net-only"><label class="field"><span>Hostname or IP</span><input name="address" value="${esc(h.address)}" placeholder="server.example.com" spellcheck="false"></label>
-      <label class="field"><span>Port</span><input type="number" name="port" min="1" max="65535" value="${h.port ?? ''}" data-ssh-port="${g?.port || 22}" placeholder="${proto === 'ssh' ? g?.port || 22 : 21}"></label></div>
+      <label class="field"><span>Port</span><input type="number" name="port" min="1" max="65535" value="${h.port ?? ''}" data-ssh-port="${g?.port || 22}" placeholder="${proto === 'ssh' ? g?.port || 22 : { rdp: 3389, vnc: 5900 }[proto] || 21}"></label></div>
       <label class="field"><span>Group</span><select name="groupId">${opt('', 'No group', !h.groupId)}${[...d.groups].sort(byName).map((x) => opt(x.id, x.name, x.id === h.groupId)).join('')}</select></label>
     </div>
     <div class="fieldset serial-only"><div class="legend">Serial port</div>
@@ -1529,12 +1535,19 @@ function hostForm(id) {
       <label class="field net-only"><span>Username</span><input name="username" value="${esc(h.username || '')}" data-ssh-ph="${esc(g?.username || 'Ask when connecting')}" data-ftp-ph="${esc(g?.username || 'anonymous')}" placeholder="${esc(proto === 'ssh' ? g?.username || 'Ask when connecting' : g?.username || 'anonymous')}" spellcheck="false"></label>
       <label class="field"><span>Password</span><input type="password" name="password" data-net-ph="${hasPw ? '•••••••• saved — type to change' : 'Optional — asked when needed'}" data-serial-ph="${hasPw ? '•••••••• saved — type to change' : `Optional — for Type password (${isMac ? '⌘⇧P' : 'Ctrl+Shift+P'})`}" placeholder="${hasPw ? '•••••••• saved — type to change' : 'Optional — asked when needed'}" autocomplete="new-password"></label>
       ${hasPw ? `<label class="check"><input type="checkbox" name="clearPassword"><span>Forget saved password</span></label>` : ''}
+      <div class="rdp-only">
+      <label class="field"><span>Domain</span><input name="domain" value="${esc(h.domain || '')}" placeholder="Optional — or type DOMAIN\\user as the username" spellcheck="false"></label>
+      </div>
       <div class="ssh-only">
       <label class="field"><span>Key</span><select name="keyId">${opt('', g?.keyId ? `From group (${app.key(g.keyId)?.label || 'key'})` : 'None', !h.keyId)}${[...d.keys].sort(byName).map((k) => opt(k.id, k.label, k.id === h.keyId)).join('')}</select></label>
       <label class="check"><input type="checkbox" name="useAgent" ${h.useAgent !== false ? 'checked' : ''}><span>Try keys from my SSH agent<small>ssh-agent, 1Password, Secretive, Pageant…</small></span></label>
       </div>
     </div>
-    <div class="fieldset ssh-only"><div class="legend">Jump host</div>
+    <div class="fieldset desk-only"><div class="legend">Remote screen</div>
+      <label class="check"><input type="checkbox" name="shareClipboard" ${h.shareClipboard !== false ? 'checked' : ''}><span>Share the clipboard<small>Copy on one side, paste on the other (text).</small></span></label>
+      <label class="check"><input type="checkbox" name="rdpHidpi" ${h.rdpHidpi !== false && !(isVnc(h) && h.rdpHidpi == null) ? 'checked' : ''}><span>Sharp on high-resolution screens<small>Uses your display's full resolution. Windows scales its text to match; most VNC servers don't, so text gets small there. Turn off on slow connections.</small></span></label>
+    </div>
+    <div class="fieldset jump-ok"><div class="legend">Jump host</div>
       <label class="field"><select name="jumpHostId">${opt('', 'Connect directly', !h.jumpHostId)}${d.hosts.filter((x) => x.id !== id && isSsh(x)).sort(byName).map((x) => opt(x.id, `Via ${x.label}`, x.id === h.jumpHostId)).join('')}</select></label>
     </div>
     <div class="fieldset"><div class="legend">Appearance</div>${swatches('color', h.color)}</div>
@@ -1543,7 +1556,7 @@ function hostForm(id) {
       <label class="field"><textarea class="short" name="notes" placeholder="Anything worth remembering">${esc(h.notes || '')}</textarea></label>
     </div>`,
     `${id ? `<button type="button" class="btn danger" data-dact="delete">${icon.trash}</button>` : ''}<div class="spacer"></div>
-     <button type="button" class="btn" data-dact="save-connect">${proto === 'ssh' || proto === 'serial' ? `${icon.play} Connect` : `${icon.folder} Open`}</button>
+     <button type="button" class="btn" data-dact="save-connect">${['ssh', 'serial', 'rdp', 'vnc'].includes(proto) ? `${icon.play} Connect` : `${icon.folder} Open`}</button>
      <button type="submit" class="btn primary">Save</button>`,
   );
 }
@@ -1799,6 +1812,8 @@ function wireDrawer(kind, id) {
               localEcho: checked('localEcho'),
             }
           : {}),
+        ...(protocol === 'rdp' ? { domain: val('domain') || null } : {}),
+        ...(protocol === 'rdp' || protocol === 'vnc' ? { shareClipboard: checked('shareClipboard'), rdpHidpi: checked('rdpHidpi') } : {}),
         groupId: val('groupId') || null,
         username: val('username') || null,
         keyId: val('keyId') || null,
@@ -1910,15 +1925,20 @@ function wireDrawer(kind, id) {
     const sync = () => {
       const proto = form.querySelector('input[name=protocol]:checked')?.value || 'ssh';
       form.querySelectorAll('.ssh-only').forEach((el) => (el.hidden = proto !== 'ssh'));
+      form.querySelectorAll('.rdp-only').forEach((el) => (el.hidden = proto !== 'rdp'));
+      form.querySelectorAll('.desk-only').forEach((el) => (el.hidden = proto !== 'rdp' && proto !== 'vnc'));
+      form.querySelectorAll('.jump-ok').forEach((el) => (el.hidden = !['ssh', 'rdp', 'vnc'].includes(proto)));
+      // A new host: sharp text suits Remote Desktop (Windows scales to match), not most VNC servers.
+      if (!id && form.elements.rdpHidpi) form.elements.rdpHidpi.checked = proto !== 'vnc';
       form.querySelectorAll('.net-only').forEach((el) => (el.hidden = proto === 'serial'));
       form.querySelectorAll('.serial-only').forEach((el) => (el.hidden = proto !== 'serial'));
       form.elements.password.placeholder = proto === 'serial' ? form.elements.password.dataset.serialPh : form.elements.password.dataset.netPh;
       if (proto === 'serial' && !scanned) { scanned = true; scanPorts(); }
       form.querySelectorAll('.proto-hint').forEach((el) => (el.hidden = el.dataset.for !== proto));
-      form.elements.port.placeholder = proto === 'ssh' ? form.elements.port.dataset.sshPort : '21';
-      form.elements.username.placeholder = proto === 'ssh' ? form.elements.username.dataset.sshPh : form.elements.username.dataset.ftpPh;
+      form.elements.port.placeholder = proto === 'ssh' ? form.elements.port.dataset.sshPort : { rdp: '3389', vnc: '5900' }[proto] || '21';
+      form.elements.username.placeholder = proto === 'vnc' ? 'Only for Mac or user-name sign-in' : proto === 'ssh' || proto === 'rdp' ? form.elements.username.dataset.sshPh : form.elements.username.dataset.ftpPh;
       const btn = form.querySelector('[data-dact=save-connect]');
-      btn.innerHTML = proto === 'ssh' || proto === 'serial' ? `${icon.play} Connect` : `${icon.folder} Open`;
+      btn.innerHTML = ['ssh', 'serial', 'rdp', 'vnc'].includes(proto) ? `${icon.play} Connect` : `${icon.folder} Open`;
     };
     let scanned = false;
     // Fill the port suggestions with what's plugged in right now.
