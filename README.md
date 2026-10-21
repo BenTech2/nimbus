@@ -1,5 +1,7 @@
 # Nimbus
 
+![Nimbus showing hosts grouped into Home lab, Production and No group](docs/screenshot.png)
+
 A simple SSH, SFTP, FTP and serial connection manager, with no cloud, accounts or vault
 service. Your hosts live on your computer, and you move them to another computer with one
 export file.
