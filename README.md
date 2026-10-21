@@ -234,3 +234,7 @@ docker/, scripts/    the Linux ARM64 build
 - VNC: newer macOS sign-in types (when the Mac offers only those), anonymous-TLS VeNCrypt,
   file transfer, sound.
 - Port forwarding, agent forwarding, split panes, editing a remote file in place.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
